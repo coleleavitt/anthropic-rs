@@ -1,0 +1,179 @@
+//! A bare, reusable Anthropic SDK.
+//!
+//! Three layers, each usable on its own:
+//!
+//! 1. **Auth domain** — secret newtypes ([`AccessToken`], [`RefreshToken`],
+//!    [`ApiKey`]), the [`Credential`] kind, [`OAuthTokens`] with expiry logic,
+//!    PKCE ([`PkcePair`]), and the endpoint/scope constants. No I/O.
+//! 2. **Shared account store** (`store` feature) — a multi-account credential
+//!    file at `~/.anthropic-accounts/accounts.json`, deliberately *not* under
+//!    any single application's config directory, so a coding agent, a build
+//!    tool, and a one-off script all read the same login.
+//! 3. **Clients** (`client` feature) — [`OAuthClient`] for the token endpoint
+//!    and [`MessagesClient`] for the Messages API, plus an [`SseDecoder`] whose
+//!    framing rules are testable without a network.
+//!
+//! # Auth-only consumers
+//!
+//! ```toml
+//! anthropic = { version = "0.1", default-features = false }
+//! ```
+//!
+//! links no HTTP client and touches no filesystem.
+//!
+//! # Example: resolve a credential and send one message
+//!
+//! ```no_run
+//! # #[cfg(all(feature = "client", feature = "store"))]
+//! # async fn run() -> anthropic::Result<()> {
+//! use anthropic::{AccountStore, Endpoints, Message, MessagesClient, MessagesRequest};
+//!
+//! let loaded = AccountStore::load_or_migrate()?;
+//! let account = loaded.store.pick(chrono::Utc::now())?;
+//!
+//! let client = MessagesClient::new(Endpoints::from_env());
+//! let request =
+//!     MessagesRequest::new("claude-sonnet-4-6", 1024, vec![Message::user("Say hello.")]);
+//! let response = client.send(&account.credential, &request).await?;
+//! println!("{}", response.text());
+//! # Ok(())
+//! # }
+//! ```
+
+#![forbid(unsafe_code)]
+#![warn(missing_docs)]
+
+pub mod account;
+pub mod cch;
+#[cfg(feature = "store")]
+pub mod credentials;
+#[cfg(feature = "device")]
+pub mod device;
+pub mod endpoints;
+pub mod error;
+#[cfg(feature = "federation")]
+pub mod federation;
+#[cfg(feature = "store")]
+mod file_security;
+#[cfg(feature = "store")]
+mod legacy;
+pub mod messages;
+pub mod oauth;
+#[cfg(feature = "interactive-oauth")]
+pub mod oauth_callback;
+pub mod pkce;
+pub mod request;
+pub mod token;
+
+#[cfg(feature = "store")]
+pub mod store;
+
+pub use account::{Account, Unavailable};
+pub use cch::{
+    CCH_PLACEHOLDER, CCH_SEED_2_1_233, build_cch_preimage, compute_cch, sign_request_body,
+};
+#[cfg(feature = "store")]
+pub use credentials::{
+    FileSecretStore, NATIVE_CLAUDE_KEYRING_SERVICE, NativeClaudeCredentialSource,
+    NativeClaudeImport, NativeTrustedDeviceToken, SecretStore, discover_native_claude_credentials,
+    import_native_claude_file, native_claude_credentials_path, native_claude_keyring_account,
+    native_claude_keyring_service,
+};
+#[cfg(feature = "secure-store")]
+pub use credentials::{KeyringSecretStore, import_native_claude_keyring};
+#[cfg(feature = "device")]
+pub use device::{
+    AttestationPolicy, AttestationStatus, CoworkDeviceClient, CoworkDeviceKey, CoworkPlatform,
+    CreateSessionBinding, DeviceId, DeviceIdentityStore, RegisteredCoworkDevice,
+    TRUSTED_DEVICE_TOKEN_ENV, TrustedDeviceClient, TrustedDeviceEnrollment, TrustedDeviceToken,
+    VerifiedLevel, build_bind_preimage, trusted_device_header, trusted_device_token_from_env,
+};
+pub use endpoints::{Endpoints, Scope};
+pub use error::{Error, Result};
+#[cfg(feature = "federation")]
+pub use federation::{
+    FederatedToken, FederationClient, FederationConfig, FederationEnvironment, IdentityTokenSource,
+};
+#[cfg(feature = "client")]
+pub use messages::MessagesClient;
+pub use messages::{
+    ContentBlock, Message, MessagesRequest, MessagesResponse, Role, SseDecoder, SseEvent, Usage,
+};
+#[cfg(feature = "client")]
+pub use oauth::OAuthClient;
+pub use oauth::{
+    AuthorizeRequest, RevokeOutcome, TokenRequest, TokenResponse, parse_redirect_code,
+};
+#[cfg(feature = "interactive-oauth")]
+pub use oauth_callback::LoopbackLogin;
+pub use pkce::{PkcePair, PkceVerifier, generate_state};
+pub use request::HeaderMutation;
+#[cfg(feature = "store")]
+pub use store::{AccountStore, LoadSource, Loaded, default_store_path, store_dir};
+pub use token::{AccessToken, ApiKey, AuthHeader, Credential, OAuthTokens, RefreshToken};
+
+/// Begin an interactive login: the authorize URL to open, plus the PKCE
+/// verifier and state that must be carried to the code exchange.
+///
+/// Kept as one call so a consumer cannot accidentally build the URL with one
+/// PKCE pair and exchange with another.
+pub struct LoginStart {
+    /// URL the user should open in a browser.
+    pub authorize_url: url::Url,
+    /// Verifier to pass to the code exchange.
+    pub verifier: PkceVerifier,
+    /// Anti-CSRF state to verify against the redirect.
+    pub state: String,
+}
+
+/// Build the authorize URL plus its matching PKCE material.
+pub fn start_login(endpoints: &Endpoints) -> Result<LoginStart> {
+    let pkce = PkcePair::generate()?;
+    let state = generate_state()?;
+    let authorize_url = AuthorizeRequest {
+        endpoints,
+        pkce: &pkce,
+        state: &state,
+        scopes: &endpoints::AUTHORIZE_SCOPES,
+    }
+    .to_url()?;
+    Ok(LoginStart {
+        authorize_url,
+        verifier: pkce.verifier,
+        state,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_login_binds_url_verifier_and_state_normal() {
+        let endpoints = Endpoints::prod();
+        let login = start_login(&endpoints).unwrap();
+
+        let pairs: std::collections::HashMap<_, _> =
+            login.authorize_url.query_pairs().into_owned().collect();
+        assert_eq!(pairs["state"], login.state);
+        // The URL carries the challenge derived from the returned verifier.
+        let expected = PkcePair::from_verifier(login.verifier.clone()).challenge;
+        assert_eq!(pairs["code_challenge"], expected);
+        assert_eq!(pairs["code_challenge_method"], pkce::CODE_CHALLENGE_METHOD);
+    }
+
+    #[test]
+    fn login_round_trip_verifies_state_robust() {
+        let login = start_login(&Endpoints::prod()).unwrap();
+        let pasted = format!("the-code#{}", login.state);
+        assert_eq!(
+            parse_redirect_code(&pasted, &login.state).unwrap(),
+            "the-code"
+        );
+        // A tampered state is refused.
+        assert!(matches!(
+            parse_redirect_code("the-code#tampered", &login.state),
+            Err(Error::StateMismatch)
+        ));
+    }
+}
