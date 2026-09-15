@@ -119,6 +119,15 @@ pub fn redact_secrets(input: &str) -> String {
     out
 }
 
+/// A stable, non-secret handle for a token: the first 16 hex characters of
+/// its SHA-256. Logs, leases, and dead-token records carry this, never the
+/// token itself. Matches the fork's `tokenFingerprint`.
+pub fn token_fingerprint(token: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(token.as_bytes());
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
 /// The account descriptor returned alongside a token grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenAccount {

@@ -73,9 +73,13 @@ pub mod stream_signals;
 pub mod token;
 
 #[cfg(feature = "store")]
+pub mod refresh_claim;
+#[cfg(feature = "store")]
+pub mod routing;
+#[cfg(feature = "store")]
 pub mod store;
 
-pub use account::{Account, Unavailable};
+pub use account::{Account, QuotaObservation, RefreshLease, Unavailable};
 pub use cch::{
     CCH_PLACEHOLDER, CCH_SEED_2_1_233, build_cch_preimage, compute_cch, sign_request_body,
 };
@@ -114,10 +118,14 @@ pub use oauth::{
 #[cfg(feature = "interactive-oauth")]
 pub use oauth_callback::LoopbackLogin;
 pub use pkce::{PkcePair, PkceVerifier, generate_state};
+#[cfg(feature = "store")]
+pub use refresh_claim::RefreshClaim;
 pub use request::HeaderMutation;
 #[cfg(feature = "store")]
 pub use store::{AccountStore, LoadSource, Loaded, default_store_path, store_dir};
-pub use token::{AccessToken, ApiKey, AuthHeader, Credential, OAuthTokens, RefreshToken};
+pub use token::{
+    AccessToken, ApiKey, AuthHeader, Credential, OAuthTokens, RefreshToken, token_fingerprint,
+};
 
 /// Begin an interactive login: the authorize URL to open, plus the PKCE
 /// verifier and state that must be carried to the code exchange.

@@ -120,6 +120,9 @@ impl LegacyAccount {
             rate_limited_until: timestamp_from_epoch_ms(self.rate_limit_reset_time),
             last_error,
             id,
+            quota: None,
+            refresh_lease: None,
+            dead_refresh_fingerprint: None,
         })
     }
 }

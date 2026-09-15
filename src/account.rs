@@ -9,12 +9,76 @@ use crate::error::{Error, Result};
 use crate::token::{Credential, OAuthTokens};
 
 /// Why an account is not currently usable.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Unavailable {
     /// The user (or a permanent auth failure) disabled it.
     Disabled,
     /// It is in a rate-limit cooldown until the given instant.
     RateLimited(DateTime<Utc>),
+    /// A fresh quota reading says a plan window is exhausted. Anthropic
+    /// reports exhaustion through the usage API, not through a cooldown, so
+    /// an account at 100% of its weekly window would otherwise look available.
+    QuotaExhausted(QuotaObservation),
+}
+
+/// Utilisation at or above this is treated as no headroom left.
+pub const QUOTA_EXHAUSTED_PERCENT: f64 = 100.0;
+
+/// A quota reading older than this is too stale to disqualify an account.
+pub const QUOTA_OBSERVATION_MAX_AGE_SECS: i64 = 30 * 60;
+
+/// Last observed plan-window utilisation, as percentages (0–100).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuotaObservation {
+    /// Five-hour window utilisation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour_percent: Option<f64>,
+    /// Seven-day window utilisation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day_percent: Option<f64>,
+    /// When the reading was taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<DateTime<Utc>>,
+}
+
+impl QuotaObservation {
+    /// Whether this reading says no headroom is left. Deliberately fails
+    /// open: a missing timestamp, a stale reading, or non-finite numbers
+    /// leave the account selectable, so a bad snapshot can never strand
+    /// every account.
+    pub fn is_exhausted(&self, now: DateTime<Utc>) -> bool {
+        let Some(checked_at) = self.checked_at else {
+            return false;
+        };
+        if (now - checked_at).num_seconds() > QUOTA_OBSERVATION_MAX_AGE_SECS {
+            return false;
+        }
+        [self.five_hour_percent, self.seven_day_percent]
+            .into_iter()
+            .flatten()
+            .any(|percent| percent.is_finite() && percent >= QUOTA_EXHAUSTED_PERCENT)
+    }
+}
+
+/// An in-flight refresh claim. Anthropic revokes an entire token family when
+/// the same refresh token is presented twice, so concurrent processes must
+/// not both POST it — the store CAS alone is too late, because by then both
+/// network calls have already happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshLease {
+    /// Random lease id (never a PID: PIDs are recycled).
+    pub id: String,
+    /// Lease expiry, epoch milliseconds.
+    #[serde(with = "chrono::serde::ts_milliseconds")]
+    pub until: DateTime<Utc>,
+    /// Fingerprint of the refresh token being spent — never the token.
+    pub token_fingerprint: String,
+    /// The process holding the claim; diagnostics only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub holder_pid: Option<u32>,
+    /// When the claim was taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<DateTime<Utc>>,
 }
 
 /// One credential the caller can route requests through.
@@ -45,6 +109,21 @@ pub struct Account {
     /// Last error recorded against this account, already secret-redacted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Last observed plan-window utilisation, so selection can skip an
+    /// exhausted account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<QuotaObservation>,
+    /// In-flight cross-process refresh claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_lease: Option<RefreshLease>,
+    /// Fingerprint of a refresh token Anthropic already rejected with
+    /// `invalid_grant`. A revoked family never recovers, but the credential
+    /// stays on disk, so without this the router re-presents it on every pass.
+    /// Mirrors Claude Code's in-memory `u2n` set, persisted so a restart does
+    /// not start asking again; scoped to the token, not the account, so a
+    /// later re-login is not stranded by its predecessor's verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dead_refresh_fingerprint: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -75,6 +154,9 @@ impl Account {
             last_used_at: None,
             rate_limited_until: None,
             last_error: None,
+            quota: None,
+            refresh_lease: None,
+            dead_refresh_fingerprint: None,
         }
     }
 
@@ -94,6 +176,11 @@ impl Account {
     pub fn unavailable_reason(&self, now: DateTime<Utc>) -> Option<Unavailable> {
         if !self.enabled {
             return Some(Unavailable::Disabled);
+        }
+        if let Some(quota) = &self.quota
+            && quota.is_exhausted(now)
+        {
+            return Some(Unavailable::QuotaExhausted(quota.clone()));
         }
         match self.rate_limited_until {
             Some(until) if now < until => Some(Unavailable::RateLimited(until)),
@@ -148,6 +235,34 @@ impl Account {
         *current = tokens;
         self.email = email;
         Ok(())
+    }
+
+    /// The OAuth session, when this is an OAuth account.
+    pub fn oauth(&self) -> Option<&OAuthTokens> {
+        match &self.credential {
+            Credential::Oauth(tokens) => Some(tokens),
+            Credential::ApiKey { .. } => None,
+        }
+    }
+
+    /// Whether this is an enabled OAuth account whose access token has not
+    /// expired at `now` — i.e. its bearer can be sent without a refresh.
+    pub fn oauth_credential_is_live(&self, now: DateTime<Utc>) -> bool {
+        self.enabled
+            && self
+                .oauth()
+                .is_some_and(|tokens| !tokens.access.expose().is_empty() && !tokens.is_expired(now))
+    }
+
+    /// Whether the stored refresh token is already known-dead (rejected with
+    /// `invalid_grant`).
+    pub fn refresh_token_is_dead(&self) -> bool {
+        match (&self.dead_refresh_fingerprint, self.oauth()) {
+            (Some(dead), Some(tokens)) => {
+                *dead == crate::token::token_fingerprint(tokens.refresh.expose())
+            }
+            _ => false,
+        }
     }
 
     /// The display name for pickers: label, else email, else id.
