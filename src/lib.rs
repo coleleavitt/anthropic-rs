@@ -12,6 +12,14 @@
 //! 3. **Clients** (`client` feature) — [`OAuthClient`] for the token endpoint
 //!    and [`MessagesClient`] for the Messages API, plus an [`SseDecoder`] whose
 //!    framing rules are testable without a network.
+//! 4. **Request and routing policy** (pure, no I/O) — the Claude Code 2.1.260
+//!    fingerprint ([`claude_code`], [`claude_version`], [`billing`]), model
+//!    capabilities and refusal routes ([`models`]), thinking/cache/tool
+//!    shaping ([`shaping`]), retry classification ([`retry`]), SSE stream
+//!    signals ([`stream_signals`]), the model catalog ([`model_catalog`]) and
+//!    profile identity ([`profile`]). With `store`: refresh leases and
+//!    dead-token records ([`refresh_claim`]), pool selection ([`routing`]),
+//!    and — with `client` — the fail-closed shared refresh ([`refresh`]).
 //!
 //! # Auth-only consumers
 //!

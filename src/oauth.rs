@@ -408,44 +408,55 @@ impl OAuthClient {
     }
 
     /// Resolve, refresh if needed, and persist the chosen account from a shared
-    /// account store path using refresh-token compare-and-swap.
+    /// account store path.
+    ///
+    /// A refresh goes through [`OAuthClient::refresh_shared`]: the account's
+    /// refresh lease is claimed before the token endpoint is called, a
+    /// known-dead token is never presented, a peer's rotation is adopted
+    /// instead of re-spending, and the rotation is committed to the store with
+    /// compare-and-swap so the next reader never sees the spent token.
     #[cfg(feature = "store")]
     pub async fn prepare_account_in_store(
         &self,
         path: &Path,
         account_id: &str,
     ) -> Result<crate::account::Account> {
-        for _ in 0..3 {
-            let snapshot = crate::store::AccountStore::load_or_migrate_from(path, &[])?;
-            let account = snapshot
-                .store
-                .get(account_id)
-                .cloned()
-                .ok_or_else(|| Error::UnknownAccount(account_id.to_owned()))?;
-            let crate::token::Credential::Oauth(tokens) = &account.credential else {
-                return self.prepare_account(&account).await;
-            };
-            if !tokens.needs_refresh(Utc::now()) {
-                return self.prepare_account(&account).await;
-            }
-            let refreshed = self.refresh(tokens).await?;
-            if crate::store::AccountStore::replace_oauth_after_refresh(
-                path,
-                account_id,
-                &tokens.refresh,
-                refreshed,
-            )? {
-                let reloaded = crate::store::AccountStore::load_or_migrate_from(path, &[])?;
-                return reloaded
-                    .store
-                    .get(account_id)
-                    .cloned()
-                    .ok_or_else(|| Error::UnknownAccount(account_id.to_owned()));
-            }
+        let snapshot = crate::store::AccountStore::load_or_migrate_from(path, &[])?;
+        let account = snapshot
+            .store
+            .get(account_id)
+            .cloned()
+            .ok_or_else(|| Error::UnknownAccount(account_id.to_owned()))?;
+        let crate::token::Credential::Oauth(tokens) = &account.credential else {
+            return self.prepare_account(&account).await;
+        };
+        if !tokens.needs_refresh(Utc::now()) {
+            return self.prepare_account(&account).await;
         }
-        Err(Error::Protocol(
-            "oauth refresh was repeatedly superseded by another process".into(),
-        ))
+        let outcome = self
+            .refresh_shared(
+                path,
+                tokens,
+                &crate::refresh::SharedRefreshOptions::default(),
+            )
+            .await?;
+        let reloaded = crate::store::AccountStore::load_or_migrate_from(path, &[])?;
+        let persisted = reloaded
+            .store
+            .get(account_id)
+            .cloned()
+            .ok_or_else(|| Error::UnknownAccount(account_id.to_owned()))?;
+        match &persisted.credential {
+            crate::token::Credential::Oauth(stored)
+                if stored.refresh == outcome.tokens.refresh
+                    || !stored.needs_refresh(Utc::now()) =>
+            {
+                Ok(persisted)
+            }
+            _ => Err(Error::RefreshRefused(
+                "oauth refresh outcome does not match the persisted account".into(),
+            )),
+        }
     }
 
     /// Pick the current shared-store account, refresh it if needed, and persist

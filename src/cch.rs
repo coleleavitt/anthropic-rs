@@ -1,11 +1,18 @@
-//! Claude Code 2.1.233 billing-header CCH signing.
+//! Claude Code 2.1.138–2.1.233 billing-header CCH signing (legacy).
 //!
-//! The native binary patches `cch=00000` inside the first billing system block
-//! immediately before transport. Versions 2.1.172 and newer hash a canonical
+//! Those versions patch `cch=00000` inside the first billing system block
+//! immediately before transport. Versions 2.1.172–2.1.233 hash a canonical
 //! preimage: every `model` value is emptied and every integer `max_tokens`
 //! field (plus one adjacent comma) is removed. Nested-field native oracles
 //! confirm that this transform is global. Only the five-character wire
 //! slot is changed; the actual request keeps its model and token limit.
+//!
+//! **Claude Code 2.1.260 does not sign this slot.** It emits the literal
+//! `cch=00000;` and derives the `cc_version` suffix from the first user
+//! message instead — see [`crate::billing`]. Requests fingerprinted as
+//! 2.1.260 or newer must use [`crate::billing::build_billing_header_value`]
+//! and must not call [`sign_request_body`]; this module is retained for
+//! diagnostics and for callers pinned to the 2.1.233 fingerprint.
 
 use crate::error::{Error, Result};
 
