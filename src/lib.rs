@@ -61,11 +61,13 @@ mod file_security;
 #[cfg(feature = "store")]
 mod legacy;
 pub mod messages;
+pub mod model_catalog;
 pub mod models;
 pub mod oauth;
 #[cfg(feature = "interactive-oauth")]
 pub mod oauth_callback;
 pub mod pkce;
+pub mod profile;
 pub mod request;
 pub mod retry;
 pub mod shaping;
