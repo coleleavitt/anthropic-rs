@@ -44,7 +44,10 @@
 #![warn(missing_docs)]
 
 pub mod account;
+pub mod billing;
 pub mod cch;
+pub mod claude_code;
+pub mod claude_version;
 #[cfg(feature = "store")]
 pub mod credentials;
 #[cfg(feature = "device")]
@@ -58,11 +61,15 @@ mod file_security;
 #[cfg(feature = "store")]
 mod legacy;
 pub mod messages;
+pub mod models;
 pub mod oauth;
 #[cfg(feature = "interactive-oauth")]
 pub mod oauth_callback;
 pub mod pkce;
 pub mod request;
+pub mod retry;
+pub mod shaping;
+pub mod stream_signals;
 pub mod token;
 
 #[cfg(feature = "store")]
