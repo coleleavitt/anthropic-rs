@@ -44,6 +44,20 @@ pub enum Error {
     #[error("oauth refresh token has expired; re-authentication is required")]
     RefreshTokenExpired,
 
+    /// Anthropic already rejected this refresh token with `invalid_grant`
+    /// (the token family is revoked). It is never presented again; the user
+    /// must re-authenticate.
+    #[error("oauth refresh token was revoked by anthropic; re-authentication is required")]
+    RefreshTokenRevoked,
+
+    /// The shared refresh declined to spend the refresh token because it
+    /// could not establish exclusive, well-founded ownership of it (claim
+    /// timed out, the account vanished, the store was unreadable, or the
+    /// commit was superseded by an unusable row). Nothing was sent to the
+    /// token endpoint; retrying later may succeed.
+    #[error("oauth refresh refused (fail-closed): {0}")]
+    RefreshRefused(String),
+
     /// The token response was missing or malformed in a field required for a
     /// usable session.
     #[error("token response invalid: {0}")]
@@ -163,6 +177,7 @@ impl Error {
             Error::StateMismatch
             | Error::ExpiredNoRefresh
             | Error::RefreshTokenExpired
+            | Error::RefreshTokenRevoked
             | Error::MalformedTokenResponse(_)
             | Error::InvalidRedirect
             | Error::WouldDeleteAllAccounts
@@ -173,6 +188,7 @@ impl Error {
             | Error::Callback(_)
             | Error::Crypto(_) => true,
             Error::NoUsableAccount(_)
+            | Error::RefreshRefused(_)
             | Error::Io(_)
             | Error::Random(_)
             | Error::Federation(_)
@@ -196,5 +212,17 @@ impl Error {
     /// rotated away from rather than disabled.
     pub fn is_rate_limited(&self) -> bool {
         matches!(self, Error::Endpoint { status: 429, .. })
+    }
+
+    /// Whether the token endpoint reported `invalid_grant`: the refresh
+    /// token's family is revoked and no retry can succeed.
+    pub fn is_invalid_grant(&self) -> bool {
+        match self {
+            Error::RefreshTokenRevoked => true,
+            Error::Endpoint {
+                error_code, body, ..
+            } => error_code.as_deref() == Some("invalid_grant") || body.contains("invalid_grant"),
+            _ => false,
+        }
     }
 }

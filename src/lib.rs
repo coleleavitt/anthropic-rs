@@ -72,6 +72,8 @@ pub mod shaping;
 pub mod stream_signals;
 pub mod token;
 
+#[cfg(all(feature = "client", feature = "store"))]
+pub mod refresh;
 #[cfg(feature = "store")]
 pub mod refresh_claim;
 #[cfg(feature = "store")]
@@ -118,6 +120,8 @@ pub use oauth::{
 #[cfg(feature = "interactive-oauth")]
 pub use oauth_callback::LoopbackLogin;
 pub use pkce::{PkcePair, PkceVerifier, generate_state};
+#[cfg(all(feature = "client", feature = "store"))]
+pub use refresh::{DeadRefreshTokens, RefreshSource, SharedRefreshOptions, SharedRefreshOutcome};
 #[cfg(feature = "store")]
 pub use refresh_claim::RefreshClaim;
 pub use request::HeaderMutation;

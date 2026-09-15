@@ -17,7 +17,7 @@ default = ["store", "client"]
 store = []
 
 # reqwest-backed OAuth token client and Messages API client.
-client = ["dep:reqwest"]
+client = ["dep:reqwest", "dep:tokio"]
 
 # Loopback callback server for automatic browser OAuth completion.
 interactive-oauth = ["client", "dep:httparse", "dep:tokio"]
