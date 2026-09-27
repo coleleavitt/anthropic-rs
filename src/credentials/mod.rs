@@ -16,7 +16,11 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::error::{Error, Result};
 use crate::token::{
-    AccessToken, MAX_TOKEN_LEN, OAuthTokens, RefreshToken, is_valid_access_token,
+    AccessToken,
+    MAX_TOKEN_LEN,
+    OAuthTokens,
+    RefreshToken,
+    is_valid_access_token,
     is_valid_refresh_token,
 };
 
@@ -270,7 +274,8 @@ fn parse_native_document(
             "native credential document exceeds 64 KiB".into(),
         ));
     }
-    let document: NativeDocument = serde_json::from_slice(raw)?;
+    let document: NativeDocument =
+        crate::file_security::parse_json_redacted(raw, "native credential document")?;
     let oauth = document.claude_ai_oauth.ok_or_else(|| {
         Error::Protocol("native credential document has no claudeAiOauth entry".into())
     })?;

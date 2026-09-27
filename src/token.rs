@@ -128,6 +128,36 @@ pub fn token_fingerprint(token: &str) -> String {
     digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
+/// Prefix of a vault-custody tombstone: the non-secret marker a custody
+/// setup writes into a host credential slot in place of a real OAuth pair
+/// (`{"access": "", "refresh": "claustrum-tombstone:v1:anthropic"}`).
+///
+/// Recognition is provider-scoped ([`custody_tombstone_key`]) but refusal is
+/// deliberately wider: every irreversible boundary (token exchange, bearer
+/// header) rejects *any* value with this prefix, including a foreign
+/// provider's tombstone.
+pub const CUSTODY_TOMBSTONE_PREFIX: &str = "claustrum-tombstone:v1:";
+
+/// The exact tombstone value for `provider` (e.g. `anthropic`).
+pub fn custody_tombstone_key(provider: &str) -> String {
+    format!("{CUSTODY_TOMBSTONE_PREFIX}{provider}")
+}
+
+/// Whether `value` is a custody tombstone for any provider.
+pub fn is_custody_tombstone(value: &str) -> bool {
+    value.starts_with(CUSTODY_TOMBSTONE_PREFIX)
+}
+
+/// Refuse a tombstone at an irreversible boundary (refresh, bearer header).
+pub fn ensure_not_custody_tombstone(value: &str, provider: &str) -> Result<()> {
+    if is_custody_tombstone(value) {
+        return Err(Error::CustodyTombstone {
+            provider: provider.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// The account descriptor returned alongside a token grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenAccount {
@@ -282,6 +312,8 @@ impl Credential {
         match self {
             Credential::ApiKey { .. } => Ok(()),
             Credential::Oauth(tokens) => {
+                ensure_not_custody_tombstone(tokens.access.expose(), "anthropic")?;
+                ensure_not_custody_tombstone(tokens.refresh.expose(), "anthropic")?;
                 if !tokens.grants_inference() {
                     return Err(Error::Protocol(
                         "oauth credential lacks user:inference".into(),
@@ -502,5 +534,52 @@ mod tests {
         assert_eq!(back.expires_at, tokens.expires_at);
         assert_eq!(back.refresh_expires_at, tokens.refresh_expires_at);
         assert_eq!(back.access.expose(), "a");
+    }
+}
+
+#[cfg(test)]
+mod custody_tombstone_tests {
+    use super::*;
+
+    fn session(access: &str, refresh: &str) -> Credential {
+        Credential::Oauth(OAuthTokens {
+            access: AccessToken::new(access),
+            refresh: RefreshToken::new(refresh),
+            expires_at: Utc::now() + Duration::hours(1),
+            refresh_expires_at: None,
+            scopes: vec!["user:inference".into()],
+            account: None,
+            organization: None,
+        })
+    }
+
+    #[test]
+    fn tombstones_are_recognized_per_provider_and_refused_for_any_provider() {
+        assert_eq!(
+            custody_tombstone_key("anthropic"),
+            "claustrum-tombstone:v1:anthropic"
+        );
+        assert!(is_custody_tombstone("claustrum-tombstone:v1:openai"));
+        assert!(!is_custody_tombstone("sk-ant-ort01-real"));
+        let foreign = ensure_not_custody_tombstone("claustrum-tombstone:v1:openai", "anthropic");
+        assert!(matches!(foreign, Err(Error::CustodyTombstone { .. })));
+    }
+
+    #[test]
+    fn request_validation_refuses_a_tombstoned_session() {
+        let now = Utc::now();
+        let tombstoned = session(
+            "sk-ant-oat01-aaaaaaaaaaaaaaaaaaaaaaaa",
+            &custody_tombstone_key("anthropic"),
+        );
+        assert!(matches!(
+            tombstoned.validate_for_request(now),
+            Err(Error::CustodyTombstone { .. })
+        ));
+        let live = session(
+            "sk-ant-oat01-aaaaaaaaaaaaaaaaaaaaaaaa",
+            "sk-ant-ort01-bbbbbbbbbbbbbbbbbbbbbbbb",
+        );
+        assert!(live.validate_for_request(now).is_ok());
     }
 }

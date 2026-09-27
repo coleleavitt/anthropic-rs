@@ -12,13 +12,21 @@ pub mod trusted;
 
 pub use attestation::{AttestationPolicy, AttestationStatus, VerifiedLevel};
 pub use cowork::{
-    CoworkDeviceClient, CoworkDeviceKey, CoworkPlatform, CreateSessionBinding,
-    RegisteredCoworkDevice, build_bind_preimage,
+    CoworkDeviceClient,
+    CoworkDeviceKey,
+    CoworkPlatform,
+    CreateSessionBinding,
+    RegisteredCoworkDevice,
+    build_bind_preimage,
 };
 pub use identity::{DeviceId, DeviceIdentityStore};
 pub use trusted::{
-    TRUSTED_DEVICE_TOKEN_ENV, TrustedDeviceClient, TrustedDeviceEnrollment, TrustedDeviceToken,
-    trusted_device_header, trusted_device_token_from_env,
+    TRUSTED_DEVICE_TOKEN_ENV,
+    TrustedDeviceClient,
+    TrustedDeviceEnrollment,
+    TrustedDeviceToken,
+    trusted_device_header,
+    trusted_device_token_from_env,
 };
 
 fn validate_device_base_url(base_url: &str) -> crate::Result<()> {

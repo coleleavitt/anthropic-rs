@@ -2,6 +2,7 @@
 //! token endpoint: the wire request/response types, an authorize-URL builder,
 //! the manual-paste redirect parser, and an async client.
 
+#[cfg(all(feature = "client", feature = "store"))]
 use std::path::Path;
 
 use chrono::{DateTime, Duration, Utc};
@@ -356,6 +357,13 @@ impl OAuthClient {
     /// scopes, account, and organization metadata forward when the server omits
     /// them. Refuses to contact the endpoint after the refresh token expires.
     pub async fn refresh(&self, prior: &OAuthTokens) -> Result<OAuthTokens> {
+        // A custody tombstone or an empty slot is not a refresh credential:
+        // presenting it would at best burn a request and at worst leak the
+        // vault marker upstream. Refuse locally, before any I/O.
+        crate::token::ensure_not_custody_tombstone(prior.refresh.expose(), "anthropic")?;
+        if prior.refresh.expose().trim().is_empty() {
+            return Err(Error::ExpiredNoRefresh);
+        }
         if prior.is_refresh_expired(Utc::now()) {
             return Err(Error::RefreshTokenExpired);
         }
@@ -882,6 +890,36 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::RefreshTokenExpired));
         assert!(error.is_permanent());
+    }
+
+    // Port of auth-guards.test.ts: refresh refuses empty/whitespace and
+    // custody-tombstone refresh tokens before any network I/O.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn refresh_refuses_empty_and_tombstone_refresh_tokens_locally() {
+        let mut endpoints = Endpoints::prod();
+        endpoints.token_url = "http://127.0.0.1:1/must-not-be-called".into();
+        let client = OAuthClient::new(endpoints);
+        for empty in ["", "   "] {
+            let mut prior = prior_tokens();
+            prior.refresh = RefreshToken::new(empty);
+            let error = client.refresh(&prior).await.unwrap_err();
+            assert!(
+                matches!(error, Error::ExpiredNoRefresh),
+                "{empty:?}: {error}"
+            );
+        }
+        for tombstone in [
+            "claustrum-tombstone:v1:anthropic",
+            "claustrum-tombstone:v1:openai",
+        ] {
+            let mut prior = prior_tokens();
+            prior.refresh = RefreshToken::new(tombstone);
+            let error = client.refresh(&prior).await.unwrap_err();
+            assert!(matches!(error, Error::CustodyTombstone { .. }), "{error}");
+            assert!(error.is_permanent());
+            assert!(!error.to_string().contains("claustrum-tombstone"));
+        }
     }
 
     #[cfg(feature = "client")]

@@ -237,6 +237,220 @@ pub fn is_long_context_credits_required_error(status: u16, body: &str) -> bool {
         || text.contains("usage credits are required for long context")
 }
 
+/// A server-side policy verdict on the request — not a fault to retry. Claude
+/// Code 2.1.280 names each separately so the user learns which policy fired
+/// instead of seeing a bare 400/403 body. All three are already
+/// non-retryable under [`classify_retry`] (non-429 4xx); this only *names*
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderBlockKind {
+    /// HTTP 400 with `error.type == "policy_blocked"`.
+    PolicyBlocked,
+    /// `error.details.error_code == "dlp_request_denied"`: the organization's
+    /// data-loss-prevention rules.
+    DlpRequestDenied,
+    /// Pre-wired in 2.1.280 (its predicate is hard-coded false); recognized by
+    /// body text only.
+    SafetyMonitorBlocked,
+}
+
+impl ProviderBlockKind {
+    /// The wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PolicyBlocked => "policy_blocked",
+            Self::DlpRequestDenied => "dlp_request_denied",
+            Self::SafetyMonitorBlocked => "safety_monitor_blocked",
+        }
+    }
+
+    /// An actionable, user-facing explanation.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::PolicyBlocked => {
+                "Anthropic refused this request under an account or organization policy. Retrying will not change the verdict."
+            }
+            Self::DlpRequestDenied => {
+                "Anthropic refused this request under your organization's data-loss-prevention rules. Retrying will not change the verdict."
+            }
+            Self::SafetyMonitorBlocked => {
+                "Anthropic refused this request at a safety monitor. Retrying will not change the verdict."
+            }
+        }
+    }
+}
+
+/// Name a 4xx policy verdict, or `None` for anything else (2xx, 5xx, an
+/// unrelated 4xx, a rate limit).
+pub fn classify_provider_block(status: u16, body: &str) -> Option<ProviderBlockKind> {
+    if !(400..500).contains(&status) {
+        return None;
+    }
+    let text = body.to_ascii_lowercase();
+    [
+        ProviderBlockKind::PolicyBlocked,
+        ProviderBlockKind::DlpRequestDenied,
+        ProviderBlockKind::SafetyMonitorBlocked,
+    ]
+    .into_iter()
+    .find(|kind| text.contains(kind.as_str()))
+}
+
+/// `error.details.error_code` Anthropic returns when a model is gated on a
+/// newer Claude Code version than the request's `user-agent` declares.
+pub const CLAUDE_CODE_VERSION_TOO_OLD_ERROR_CODE: &str = "claude_code_version_too_old";
+
+const VERSION_TOO_OLD_MARKER: &str = "does not support this model; version ";
+const VERSION_TOO_OLD_SUFFIX: &str = " or newer is required";
+
+fn version_named_in(body: &str) -> Option<&str> {
+    let start = body.find(VERSION_TOO_OLD_MARKER)? + VERSION_TOO_OLD_MARKER.len();
+    let rest = &body[start..];
+    let end = rest.find(VERSION_TOO_OLD_SUFFIX)?;
+    let version = &rest[..end];
+    let mut parts = version.split('.');
+    let valid = (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    }) && parts.next().is_none();
+    valid.then_some(version)
+}
+
+/// Whether a 400 is the model version gate (`claude_code_version_too_old`).
+/// Anthropic gates new models on the `user-agent`'s declared
+/// `claude-cli/<version>`, not on the billing header's `cc_version`; retrying
+/// without changing the declared version is pointless. Scoped to 400 so a 429
+/// body cannot trip it.
+pub fn is_claude_code_version_too_old_error(status: u16, body: &str) -> bool {
+    status == 400
+        && (body.contains(CLAUDE_CODE_VERSION_TOO_OLD_ERROR_CODE)
+            || version_named_in(body).is_some())
+}
+
+/// The minimum Claude Code version a version-gate rejection names, if any.
+pub fn required_claude_code_version(body: &str) -> Option<&str> {
+    version_named_in(body)
+}
+
+/// Coarse class of a failed provider response, for a structured failure
+/// diagnostic (the fork's `provider_stream_failure.details.kind`). Never
+/// includes body text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFailureKind {
+    /// 401.
+    Auth,
+    /// 403.
+    Permission,
+    /// 429.
+    RateLimit,
+    /// 529 or an `overloaded_error` body.
+    Overloaded,
+    /// Other 5xx.
+    ServerError,
+    /// Other 4xx.
+    InvalidRequest,
+    /// Anything else.
+    Unknown,
+}
+
+/// Classify a non-2xx provider response. `provider_error_type` is the body's
+/// `error.type`, when it parsed.
+pub fn classify_provider_failure(
+    status: u16,
+    provider_error_type: Option<&str>,
+) -> ProviderFailureKind {
+    match status {
+        401 => ProviderFailureKind::Auth,
+        403 => ProviderFailureKind::Permission,
+        429 => ProviderFailureKind::RateLimit,
+        _ if status == 529 || provider_error_type == Some("overloaded_error") => {
+            ProviderFailureKind::Overloaded
+        }
+        500.. => ProviderFailureKind::ServerError,
+        400.. => ProviderFailureKind::InvalidRequest,
+        _ => ProviderFailureKind::Unknown,
+    }
+}
+
+/// The credential a request was actually sent with, reduced to non-secret
+/// identity. `version` distinguishes rotations of the same credential: a
+/// vault record version, or a [`crate::token_fingerprint`] of the access
+/// token for a shared-store credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialReceipt {
+    /// Stable credential slot (store account id, vault credential id).
+    pub credential_id: String,
+    /// Provider account the token executes under.
+    pub account_id: String,
+    /// Rotation marker; never the token itself.
+    pub version: String,
+}
+
+/// Why a genuine upstream 401 did or did not earn one retry. Carries no
+/// credential material, so it is safe to log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryAfter401Reason {
+    /// Same credential, same account, new version: retry once.
+    Rotated,
+    /// Re-authorization / refresh failed; nothing to retry with.
+    ReauthorizeFailed,
+    /// The replacement is a different credential slot.
+    CredentialChanged,
+    /// The replacement executes under a different provider account.
+    AccountChanged,
+    /// The replacement is the exact credential that was just rejected.
+    VersionUnchanged,
+}
+
+impl RetryAfter401Reason {
+    /// Stable log spelling (matches anthropic-auth's `ScopedRetryReason`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rotated => "rotated",
+            Self::ReauthorizeFailed => "reauthorize-failed",
+            Self::CredentialChanged => "credential-changed",
+            Self::AccountChanged => "account-changed",
+            Self::VersionUnchanged => "version-unchanged",
+        }
+    }
+}
+
+/// Decision after a 401 and one re-authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryAfter401 {
+    /// Re-send once with the current credential.
+    pub retry: bool,
+    /// Why.
+    pub reason: RetryAfter401Reason,
+}
+
+/// Decide whether a request rejected with 401 should be re-sent once with
+/// `current` (the credential obtained by re-authorizing / refreshing after
+/// the 401). Only a *new version of the same credential for the same
+/// account* may replace an in-flight 401: re-sending the exact rejected
+/// credential loops, and silently switching account or credential would
+/// change who the request executes as. Ported from anthropic-auth's
+/// `decideScopedRetryAfter401`, which is custody-independent.
+pub fn decide_retry_after_401(
+    served: &CredentialReceipt,
+    current: Option<&CredentialReceipt>,
+) -> RetryAfter401 {
+    let reason = match current {
+        None => RetryAfter401Reason::ReauthorizeFailed,
+        Some(c) if c.credential_id != served.credential_id => {
+            RetryAfter401Reason::CredentialChanged
+        }
+        Some(c) if c.account_id != served.account_id => RetryAfter401Reason::AccountChanged,
+        Some(c) if c.version == served.version => RetryAfter401Reason::VersionUnchanged,
+        Some(_) => RetryAfter401Reason::Rotated,
+    };
+    RetryAfter401 {
+        retry: reason == RetryAfter401Reason::Rotated,
+        reason,
+    }
+}
+
 /// Server-directed delay in milliseconds, or `None` when pacing is left to the
 /// client. `retry-after` may be seconds or an HTTP date (evaluated against
 /// `now_unix_ms`). Malformed values are ignored rather than waited on forever.
@@ -428,5 +642,157 @@ mod tests {
             400,
             "extra usage is required for long context"
         ));
+    }
+}
+
+#[cfg(test)]
+mod provider_verdict_tests {
+    //! Ports of retry-policy.test.ts (fork cbc1b58) and the scoped 401
+    //! decision tests of claustrum-scoped.test.ts (upstream ee0bdb5/9a1a490).
+    use super::*;
+
+    const NONE: [(&str, &str); 0] = [];
+
+    fn version_gate_body() -> String {
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Claude Code 2.1.260 does not support this model; version 2.1.280 or newer is required. Run 'claude update', or update the Claude desktop app, then try again.",
+                "details": { "error_code": "claude_code_version_too_old" }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn detects_the_version_gate_on_a_400() {
+        assert!(is_claude_code_version_too_old_error(
+            400,
+            &version_gate_body()
+        ));
+        assert!(is_claude_code_version_too_old_error(
+            400,
+            "Claude Code 2.1.260 does not support this model; version 2.1.280 or newer is required."
+        ));
+    }
+
+    #[test]
+    fn version_gate_is_scoped_to_400_and_ignores_unrelated_400s() {
+        assert!(!is_claude_code_version_too_old_error(
+            429,
+            &version_gate_body()
+        ));
+        assert!(!is_claude_code_version_too_old_error(
+            200,
+            &version_gate_body()
+        ));
+        assert!(!is_claude_code_version_too_old_error(
+            400,
+            r#"{"error":{"message":"thinking.type.disabled is not supported for this model"}}"#
+        ));
+    }
+
+    #[test]
+    fn reports_the_required_version_and_stays_non_retryable() {
+        assert_eq!(
+            required_claude_code_version(&version_gate_body()),
+            Some("2.1.280")
+        );
+        assert_eq!(required_claude_code_version("no version here"), None);
+        assert!(!classify_retry(400, &NONE, &version_gate_body()).retryable);
+    }
+
+    #[test]
+    fn names_policy_verdicts_without_changing_retryability() {
+        let body = r#"{"type":"error","error":{"type":"policy_blocked","message":"blocked"}}"#;
+        let block = classify_provider_block(400, body).unwrap();
+        assert_eq!(block, ProviderBlockKind::PolicyBlocked);
+        assert!(block.message().contains("policy"));
+        assert!(!classify_retry(400, &NONE, body).retryable);
+        assert_eq!(
+            classify_provider_block(
+                403,
+                r#"{"error":{"details":{"error_code":"dlp_request_denied"}}}"#
+            ),
+            Some(ProviderBlockKind::DlpRequestDenied)
+        );
+        assert_eq!(
+            classify_provider_block(400, "safety_monitor_blocked"),
+            Some(ProviderBlockKind::SafetyMonitorBlocked)
+        );
+    }
+
+    #[test]
+    fn provider_block_ignores_non_4xx_unrelated_and_rate_limits() {
+        assert_eq!(classify_provider_block(500, "policy_blocked"), None);
+        assert_eq!(classify_provider_block(200, "policy_blocked"), None);
+        assert_eq!(
+            classify_provider_block(400, "messages.0: invalid role"),
+            None
+        );
+        assert_eq!(
+            classify_provider_block(429, r#"{"error":{"type":"rate_limit_error"}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn failure_kinds_match_the_diagnostic_vocabulary() {
+        use ProviderFailureKind::*;
+        assert_eq!(classify_provider_failure(401, None), Auth);
+        assert_eq!(classify_provider_failure(403, None), Permission);
+        assert_eq!(classify_provider_failure(429, None), RateLimit);
+        assert_eq!(classify_provider_failure(529, None), Overloaded);
+        assert_eq!(
+            classify_provider_failure(500, Some("overloaded_error")),
+            Overloaded
+        );
+        assert_eq!(classify_provider_failure(502, None), ServerError);
+        assert_eq!(classify_provider_failure(404, None), InvalidRequest);
+        assert_eq!(classify_provider_failure(302, None), Unknown);
+    }
+
+    fn receipt(credential: &str, account: &str, version: &str) -> CredentialReceipt {
+        CredentialReceipt {
+            credential_id: credential.into(),
+            account_id: account.into(),
+            version: version.into(),
+        }
+    }
+
+    #[test]
+    fn a_401_retries_only_on_a_rotation_of_the_same_credential_and_account() {
+        let served = receipt("oauth:anthropic", "acct-a", "7");
+        let decide =
+            |current: Option<CredentialReceipt>| decide_retry_after_401(&served, current.as_ref());
+
+        let rotated = decide(Some(receipt("oauth:anthropic", "acct-a", "8")));
+        assert!(rotated.retry);
+        assert_eq!(rotated.reason, RetryAfter401Reason::Rotated);
+
+        for (current, reason) in [
+            (None, RetryAfter401Reason::ReauthorizeFailed),
+            (
+                Some(receipt("oauth:other", "acct-a", "8")),
+                RetryAfter401Reason::CredentialChanged,
+            ),
+            (
+                Some(receipt("oauth:anthropic", "acct-b", "8")),
+                RetryAfter401Reason::AccountChanged,
+            ),
+            (
+                Some(receipt("oauth:anthropic", "acct-a", "7")),
+                RetryAfter401Reason::VersionUnchanged,
+            ),
+        ] {
+            let decision = decide(current);
+            assert!(!decision.retry, "{reason:?}");
+            assert_eq!(decision.reason, reason);
+        }
+        assert_eq!(
+            RetryAfter401Reason::ReauthorizeFailed.as_str(),
+            "reauthorize-failed"
+        );
     }
 }

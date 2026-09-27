@@ -319,6 +319,108 @@ impl OAuthClient {
     }
 }
 
+/// Non-secret receipt for the shared-store credential a request was sent
+/// with: the store row id, the provider account behind it (the token's
+/// account uuid, else the row id), and the access token's fingerprint as the
+/// rotation marker.
+pub fn shared_credential_receipt(
+    store_account_id: &str,
+    tokens: &OAuthTokens,
+) -> crate::retry::CredentialReceipt {
+    crate::retry::CredentialReceipt {
+        credential_id: store_account_id.to_owned(),
+        account_id: tokens
+            .account
+            .as_ref()
+            .map_or_else(|| store_account_id.to_owned(), |a| a.uuid.clone()),
+        version: token_fingerprint(tokens.access.expose()),
+    }
+}
+
+/// Result of [`OAuthClient::recover_unauthorized`].
+#[derive(Debug)]
+pub struct UnauthorizedRecovery {
+    /// Whether to re-send once, and why (safe to log).
+    pub decision: crate::retry::RetryAfter401,
+    /// The refreshed credential, present only when `decision.retry`.
+    pub outcome: Option<SharedRefreshOutcome>,
+    /// The refresh failure, when re-authorization itself failed. A
+    /// [`Error::RefreshTokenRevoked`] here means the token is dead.
+    pub failure: Option<Error>,
+}
+
+impl OAuthClient {
+    /// Recover from a genuine upstream 401 on a shared-store credential.
+    ///
+    /// The server can revoke an access token before its stored expiry (a
+    /// peer rotated the family, a logout, a server-side invalidation). This
+    /// forces one refresh of the store row that owns `rejected_access`
+    /// through [`Self::refresh_shared`] — under the cross-process claim, so
+    /// it adopts a peer's rotation instead of double-spending — and then
+    /// applies [`crate::retry::decide_retry_after_401`]: only a new access
+    /// token for the same row and provider account earns the single retry,
+    /// so a still-rejected credential is never re-sent in a loop. A token
+    /// unknown to the store yields `ReauthorizeFailed` without any I/O
+    /// beyond the store read.
+    ///
+    /// Port of the fork's `recoverSharedAccessTokenAfter401` (c327d6e) with
+    /// upstream's `decideScopedRetryAfter401` classification.
+    pub async fn recover_unauthorized(
+        &self,
+        path: &Path,
+        rejected_access: &str,
+        options: &SharedRefreshOptions,
+    ) -> Result<UnauthorizedRecovery> {
+        use crate::retry::{RetryAfter401, RetryAfter401Reason, decide_retry_after_401};
+        let failed = |failure: Option<Error>| UnauthorizedRecovery {
+            decision: RetryAfter401 {
+                retry: false,
+                reason: RetryAfter401Reason::ReauthorizeFailed,
+            },
+            outcome: None,
+            failure,
+        };
+        let Ok(loaded) = AccountStore::load_or_migrate_from(path, &[]) else {
+            return Ok(failed(None));
+        };
+        let Some(account) = loaded.store.find_by_access_token(rejected_access) else {
+            return Ok(failed(None));
+        };
+        let Some(stored) = account
+            .oauth()
+            .filter(|t| !t.refresh.expose().trim().is_empty())
+        else {
+            return Ok(failed(None));
+        };
+        let served = shared_credential_receipt(&account.id, stored);
+        let outcome = match self.refresh_shared(path, stored, options).await {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(failed(Some(error))),
+        };
+        let current_id = outcome
+            .account_id
+            .clone()
+            .unwrap_or_else(|| account.id.clone());
+        let current = shared_credential_receipt(&current_id, &outcome.tokens);
+        // A refresh response usually omits the account block; the row's
+        // identity carries over, so compare against the served identity.
+        let current = crate::retry::CredentialReceipt {
+            account_id: if outcome.tokens.account.is_some() {
+                current.account_id
+            } else {
+                served.account_id.clone()
+            },
+            ..current
+        };
+        let decision = decide_retry_after_401(&served, Some(&current));
+        Ok(UnauthorizedRecovery {
+            decision,
+            outcome: decision.retry.then_some(outcome),
+            failure: None,
+        })
+    }
+}
+
 fn remember_if_revoked(error: Error, presented: &OAuthTokens) -> Error {
     if error.is_invalid_grant() {
         DeadRefreshTokens::remember(presented.refresh.expose());
@@ -457,6 +559,93 @@ mod tests {
     const ROTATED_BODY: &str = r#"{"access_token":"sk-ant-oat01-newnewnewnewnewnewnewnew","refresh_token":"sk-ant-ort01-newnewnewnewnewnewnewnew","expires_in":3600,"scope":"user:inference user:profile"}"#;
     const INVALID_GRANT_BODY: &str =
         r#"{"error":"invalid_grant","error_description":"Refresh token not found or invalid"}"#;
+
+    #[tokio::test]
+    async fn unauthorized_recovery_retries_once_on_rotation_and_never_on_unknown_tokens() {
+        let (url, hits) = token_server(200, ROTATED_BODY).await;
+        const TAG: &str = "recover401";
+        let path = store_path(TAG);
+        let presented = old_tokens(TAG);
+        seeded_store(&path, &presented);
+        let client = client(&url);
+
+        let unknown = client
+            .recover_unauthorized(
+                &path,
+                "sk-ant-oat01-not-in-the-store-aaaaaaaa",
+                &SharedRefreshOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!unknown.decision.retry);
+        assert_eq!(
+            unknown.decision.reason,
+            crate::retry::RetryAfter401Reason::ReauthorizeFailed
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        let recovered = client
+            .recover_unauthorized(
+                &path,
+                presented.access.expose(),
+                &SharedRefreshOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(recovered.decision.retry);
+        assert_eq!(
+            recovered.decision.reason,
+            crate::retry::RetryAfter401Reason::Rotated
+        );
+        assert_eq!(
+            recovered.outcome.unwrap().tokens.access.expose(),
+            NEW_ACCESS
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // The rejected token is gone from the store now: a second 401 on it
+        // (a stale in-flight request) cannot trigger another spend.
+        let again = client
+            .recover_unauthorized(
+                &path,
+                presented.access.expose(),
+                &SharedRefreshOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!again.decision.retry);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_recovery_reports_a_revoked_refresh_without_retrying() {
+        let (url, _hits) = token_server(400, INVALID_GRANT_BODY).await;
+        const TAG: &str = "recover401-dead";
+        let path = store_path(TAG);
+        let presented = old_tokens(TAG);
+        seeded_store(&path, &presented);
+        let recovery = client(&url)
+            .recover_unauthorized(
+                &path,
+                presented.access.expose(),
+                &SharedRefreshOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!recovery.decision.retry);
+        assert!(recovery.outcome.is_none());
+        assert!(matches!(recovery.failure, Some(Error::RefreshTokenRevoked)));
+    }
+
+    #[test]
+    fn shared_receipts_carry_only_fingerprints() {
+        let tokens = old_tokens("receipt");
+        let receipt = shared_credential_receipt("row", &tokens);
+        assert_eq!(receipt.credential_id, "row");
+        assert_eq!(receipt.account_id, "row");
+        assert_eq!(receipt.version, token_fingerprint(tokens.access.expose()));
+        assert!(!format!("{receipt:?}").contains("sk-ant"));
+    }
 
     #[tokio::test]
     async fn refresh_persists_rotation_to_the_shared_store_and_releases_the_lease() {

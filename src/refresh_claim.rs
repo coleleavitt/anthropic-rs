@@ -303,6 +303,26 @@ impl AccountStore {
             .then_some(id)
     }
 
+    /// [`Self::record_quota_for_access_token`] for a normalized
+    /// [`crate::quota::QuotaSnapshot`] (headers via
+    /// [`crate::quota::normalize_quota_headers`], or a usage poll). The
+    /// reading is stamped with the snapshot's newest window time, falling
+    /// back to `now`.
+    pub fn record_quota_snapshot_for_access_token(
+        &mut self,
+        access_token: &str,
+        snapshot: &crate::quota::QuotaSnapshot,
+        now: DateTime<Utc>,
+    ) -> Option<String> {
+        let observation = snapshot.to_observation();
+        self.record_quota_for_access_token(
+            access_token,
+            observation.five_hour_percent,
+            observation.seven_day_percent,
+            observation.checked_at.unwrap_or(now),
+        )
+    }
+
     /// The store id a new login should take. `preferred` is the label, else
     /// the profile email, else the grant email. An email is not unique on its
     /// own — one person can hold a grant in several organizations — so when
@@ -609,6 +629,38 @@ mod tests {
         assert!(s.get("a").unwrap().is_available(at(31 * 60)));
         assert!(!s.record_quota("a", None, None, at(0)));
         assert!(!s.record_quota("nope", Some(1.0), None, at(0)));
+    }
+
+    #[test]
+    fn a_normalized_header_snapshot_lands_on_its_bearer_account() {
+        let mut s = store(&["a", "b"]);
+        let access_b = s
+            .get("b")
+            .unwrap()
+            .oauth()
+            .unwrap()
+            .access
+            .expose()
+            .to_owned();
+        let now = at(0);
+        let snapshot = crate::quota::normalize_quota_headers(
+            &[
+                ("anthropic-ratelimit-unified-5h-utilization", "1.0"),
+                ("anthropic-ratelimit-unified-7d-utilization", "0.25"),
+            ],
+            now.timestamp_millis(),
+        );
+        assert_eq!(
+            s.record_quota_snapshot_for_access_token(&access_b, &snapshot, now)
+                .as_deref(),
+            Some("b")
+        );
+        let quota = s.get("b").unwrap().quota.clone().unwrap();
+        assert_eq!(quota.five_hour_percent, Some(100.0));
+        assert_eq!(quota.seven_day_percent, Some(25.0));
+        assert_eq!(quota.checked_at, Some(now));
+        assert!(!s.get("b").unwrap().is_available(at(1)));
+        assert!(s.get("a").unwrap().quota.is_none());
     }
 
     #[test]

@@ -203,7 +203,7 @@ impl AccountStore {
             false,
             "credential store",
         )?;
-        Ok(serde_json::from_slice(&raw)?)
+        crate::file_security::parse_json_redacted(&raw, "credential store")
     }
 
     /// Read the canonical store, folding in any legacy per-application store
@@ -295,7 +295,8 @@ impl AccountStore {
                 return Ok(shared.accounts);
             }
         }
-        let legacy: crate::legacy::LegacyStore = serde_json::from_slice(&raw)?;
+        let legacy: crate::legacy::LegacyStore =
+            crate::file_security::parse_json_redacted(&raw, "legacy credential store")?;
         Ok(legacy.into_accounts())
     }
 
@@ -764,7 +765,13 @@ mod tests {
     use super::*;
     use crate::account::Account;
     use crate::token::{
-        AccessToken, ApiKey, Credential, OAuthTokens, RefreshToken, TokenAccount, TokenOrganization,
+        AccessToken,
+        ApiKey,
+        Credential,
+        OAuthTokens,
+        RefreshToken,
+        TokenAccount,
+        TokenOrganization,
     };
 
     fn at(secs: i64) -> DateTime<Utc> {

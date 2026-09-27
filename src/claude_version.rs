@@ -13,7 +13,13 @@ use chrono::{DateTime, Duration, Utc};
 
 /// Verified offline floor: the Claude Code version this crate's request
 /// behavior was aligned against.
-pub const CLAUDE_CODE_VERSION: &str = "2.1.260";
+///
+/// 2.1.280 is the first release that ships `claude-opus-5-5`; Anthropic gates
+/// that model on the declared version ("Claude Code 2.1.260 does not support
+/// this model; version 2.1.280 or newer is required"). A binary diff of
+/// 2.1.278 → 2.1.280 shows no header, beta-assembly, billing-segment or OAuth
+/// change, so only the version string moves.
+pub const CLAUDE_CODE_VERSION: &str = "2.1.280";
 
 /// npm registry document for the latest Claude Code release.
 pub const LATEST_VERSION_URL: &str = "https://registry.npmjs.org/@anthropic-ai/claude-code/latest";
@@ -142,6 +148,19 @@ impl ClaudeCodeVersionTracker {
     pub fn reset(&mut self) {
         self.cached = None;
     }
+
+    /// Mark the cached live version stale, ignoring the TTL, while keeping it
+    /// current until a re-fetch replaces it (the fork's
+    /// `refreshClaudeCodeVersion`).
+    ///
+    /// Used on `claude_code_version_too_old`: a model launched after this
+    /// process cached its version would otherwise stay blocked for the rest
+    /// of the hour. The caller re-fetches and calls [`Self::adopt`].
+    pub fn invalidate(&mut self) {
+        if let Some((_, at)) = self.cached.as_mut() {
+            *at = DateTime::<Utc>::UNIX_EPOCH;
+        }
+    }
 }
 
 /// Extract `version` from the npm `latest` document.
@@ -266,16 +285,42 @@ mod tests {
     #[test]
     fn adopts_newer_and_never_downgrades_below_floor() {
         let mut tracker = ClaudeCodeVersionTracker::new();
-        assert_eq!(tracker.adopt("2.1.272", at(0)), "2.1.272");
+        assert_eq!(tracker.adopt("2.1.292", at(0)), "2.1.292");
         assert!(tracker.is_fresh(at(10)));
         assert!(!tracker.is_fresh(at(VERSION_CACHE_TTL_SECS + 1)));
         // A stale mirror reporting an older release is clamped to the floor.
         assert_eq!(tracker.adopt("2.1.100", at(20)), CLAUDE_CODE_VERSION);
+        assert_eq!(tracker.adopt("2.1.278", at(25)), CLAUDE_CODE_VERSION);
         // Garbage is ignored and leaves the current value alone.
-        tracker.adopt("2.1.280", at(30));
-        assert_eq!(tracker.adopt("not-a-version", at(40)), "2.1.280");
+        tracker.adopt("2.1.300", at(30));
+        assert_eq!(tracker.adopt("not-a-version", at(40)), "2.1.300");
         tracker.reset();
         assert_eq!(tracker.current(), CLAUDE_CODE_VERSION);
+    }
+
+    #[test]
+    fn floor_is_2_1_280_for_opus_5_5() {
+        assert_eq!(CLAUDE_CODE_VERSION, "2.1.280");
+        assert_eq!(
+            claude_code_user_agent(CLAUDE_CODE_VERSION, &UserAgentDetails::default()),
+            "claude-cli/2.1.280 (external, cli)"
+        );
+    }
+
+    #[test]
+    fn invalidate_forces_a_refresh_but_keeps_the_version() {
+        let mut tracker = ClaudeCodeVersionTracker::new();
+        // Invalidating an empty tracker is a no-op.
+        tracker.invalidate();
+        assert!(!tracker.is_fresh(at(0)));
+        assert_eq!(tracker.current(), CLAUDE_CODE_VERSION);
+        tracker.adopt("2.1.290", at(0));
+        assert!(tracker.is_fresh(at(1)));
+        tracker.invalidate();
+        assert!(!tracker.is_fresh(at(1)));
+        assert_eq!(tracker.current(), "2.1.290");
+        assert_eq!(tracker.adopt("2.1.291", at(2)), "2.1.291");
+        assert!(tracker.is_fresh(at(3)));
     }
 
     #[test]

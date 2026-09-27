@@ -5,8 +5,9 @@
 //!
 //! Everything here is a pure function of the model id. It mirrors Claude Code
 //! 2.1.260's baked capability catalog (`firstPartyNameToCanonical`, `FH8`,
-//! `N5$`, `E5$`) and 2.1.268's refusal route maps (`Swo`/`ywo`/`_wo`), as
-//! ported by the anthropic-auth fork.
+//! `N5$`, `E5$`), the 2.1.280 additions (Opus 5.5 and the
+//! `rejects_disabled_thinking` capability), and 2.1.268's refusal route maps
+//! (`Swo`/`ywo`/`_wo`), as ported by the anthropic-auth fork.
 
 /// Claude Fable 5 model id.
 pub const CLAUDE_FABLE_5_MODEL_ID: &str = "claude-fable-5";
@@ -16,6 +17,15 @@ pub const CLAUDE_MYTHOS_5_MODEL_ID: &str = "claude-mythos-5";
 pub const CLAUDE_SONNET_5_MODEL_ID: &str = "claude-sonnet-5";
 /// Claude Opus 5 model id.
 pub const CLAUDE_OPUS_5_MODEL_ID: &str = "claude-opus-5";
+/// Claude Opus 5.5 model id — a separate catalog entry in Claude Code
+/// 2.1.280, not a snapshot of Opus 5.
+pub const CLAUDE_OPUS_5_5_MODEL_ID: &str = "claude-opus-5-5";
+/// Opus 5.5 release date.
+pub const CLAUDE_OPUS_5_5_RELEASE_DATE: &str = "2026-09-18";
+/// Opus 5.5 context window (native 1M).
+pub const CLAUDE_OPUS_5_5_CONTEXT_WINDOW: u64 = 1_000_000;
+/// Opus 5.5 maximum output tokens.
+pub const CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS: u64 = 128_000;
 /// Claude Opus 4.8 model id — the refusal catch-all floor.
 pub const CLAUDE_OPUS_4_8_MODEL_ID: &str = "claude-opus-4-8";
 /// Haiku 4.5 model id.
@@ -241,8 +251,18 @@ pub fn resolve_thinking_shape_from_env(model: &str) -> ThinkingShape {
     resolve_thinking_shape(model, flag.as_deref())
 }
 
+/// Upstream `normalizeAnthropicModelId`: strip one trailing `[1m]` context
+/// qualifier (exact, case-sensitive) before any family predicate.
+pub fn normalize_anthropic_model_id(model: &str) -> &str {
+    model.strip_suffix("[1m]").unwrap_or(model)
+}
+
 fn family_matches(model: &str, family: &str) -> bool {
-    model == family || model.starts_with(&format!("{family}-"))
+    let model = normalize_anthropic_model_id(model);
+    model == family
+        || model
+            .strip_prefix(family)
+            .is_some_and(|rest| rest.starts_with('-'))
 }
 
 /// Whether the id is Claude Fable 5 or Mythos 5 (any point release/snapshot).
@@ -252,12 +272,13 @@ pub fn is_claude_fable_or_mythos_5_model(model: &str) -> bool {
 }
 
 /// Whether the id is the 5.1 point release of Fable or Mythos (`-5-1` or a
-/// `-5-1-<snapshot>`), which sits on a cheaper cache-read tier.
+/// `-5-1-<snapshot>`, trimmed and case-insensitive), which sits on a cheaper
+/// cache-read tier.
 pub fn is_claude_fable_or_mythos_5_point_one_model(model: &str) -> bool {
     let canonical = model.trim().to_ascii_lowercase();
-    [CLAUDE_FABLE_5_MODEL_ID, CLAUDE_MYTHOS_5_MODEL_ID]
+    ["claude-fable-5-1", "claude-mythos-5-1"]
         .iter()
-        .any(|id| canonical == format!("{id}-1") || canonical.starts_with(&format!("{id}-1-")))
+        .any(|id| family_matches(&canonical, id))
 }
 
 /// Whether the id is Claude Sonnet 5.
@@ -265,9 +286,37 @@ pub fn is_claude_sonnet_5_model(model: &str) -> bool {
     family_matches(model, CLAUDE_SONNET_5_MODEL_ID)
 }
 
-/// Whether the id is Claude Opus 5.
+/// Whether the id is Claude Opus 5 (or an Opus 5 snapshot) but **not** the
+/// 5.5 point release — upstream `isClaudeOpus5Model` semantics, adopted by
+/// the merge. Use [`is_claude_opus_5_family_model`] for behavior shared by
+/// 5.0 and 5.5 (adaptive-thinking injection, effort variants).
 pub fn is_claude_opus_5_model(model: &str) -> bool {
-    family_matches(model, CLAUDE_OPUS_5_MODEL_ID)
+    !is_claude_opus_5_5_model(model) && family_matches(model, CLAUDE_OPUS_5_MODEL_ID)
+}
+
+/// Whether the id is Claude Opus 5.5: the exact id, the `[1m]`-suffixed form,
+/// or a dated snapshot — never Opus 5 or an Opus 5 snapshot. Like upstream,
+/// matching is exact (no trimming or case folding).
+pub fn is_claude_opus_5_5_model(model: &str) -> bool {
+    family_matches(model, CLAUDE_OPUS_5_5_MODEL_ID)
+}
+
+/// Whether the id is Opus 5 or Opus 5.5 (upstream `isClaudeOpus5FamilyModel`).
+pub fn is_claude_opus_5_family_model(model: &str) -> bool {
+    is_claude_opus_5_model(model) || is_claude_opus_5_5_model(model)
+}
+
+/// Models that reject `thinking: {type:"disabled"}` with HTTP 400 (use
+/// `thinking.type.adaptive` and `output_config.effort` instead). Mirrors the
+/// `rejects_disabled_thinking` capability in Claude Code 2.1.280's baked
+/// catalog — Fable 5, Fable 5.1, Mythos 5.1, Opus 5.5 — plus Mythos 5, which
+/// ships an empty capability array but is hardcoded adaptive and rejects a
+/// disable exactly like Fable.
+///
+/// Opus 5 and Sonnet 5 are deliberately absent: both accept an explicit
+/// disable (Opus 5 only caps `effort` at `high` while disabled).
+pub fn model_rejects_disabled_thinking(model: &str) -> bool {
+    is_claude_fable_or_mythos_5_model(model) || is_claude_opus_5_5_model(model)
 }
 
 /// Whether the 5-series family injects `{type:"adaptive",display:"summarized"}`
@@ -278,19 +327,26 @@ pub fn is_claude_opus_5_model(model: &str) -> bool {
 pub fn model_injects_summarized_adaptive_thinking(model: &str) -> bool {
     is_claude_fable_or_mythos_5_model(model)
         || is_claude_sonnet_5_model(model)
-        || is_claude_opus_5_model(model)
+        || is_claude_opus_5_family_model(model)
 }
 
-/// Whether `speed:"fast"` (and the fast-mode beta) is accepted.
+/// Models that reject a forced `tool_choice` (`{type:"any"}` or
+/// `{type:"tool",name}`), including a host's "required" structured-output
+/// tool: Opus 5.5 (upstream anthropic-auth `eae6591`) and the Fable/Mythos 5.1
+/// point releases. `auto`/`none` stay valid.
+pub fn model_rejects_forced_tool_choice(model: &str) -> bool {
+    is_claude_opus_5_5_model(model) || is_claude_fable_or_mythos_5_point_one_model(model)
+}
+
+/// Whether `speed:"fast"` (and the fast-mode beta) is accepted: Opus 4.8,
+/// Opus 5 and Opus 5.5 (prefix match, so snapshots and `[1m]` forms count).
+///
+/// Opus 4.7 rejects `speed:"fast"` and Opus 4.6 silently runs at standard
+/// speed, so neither is eligible (upstream anthropic-auth `eae6591`).
 pub fn is_fast_mode_supported_model(model: &str) -> bool {
-    [
-        "claude-opus-4-6",
-        "claude-opus-4-7",
-        "claude-opus-4-8",
-        "claude-opus-5",
-    ]
-    .iter()
-    .any(|prefix| model.starts_with(prefix))
+    ["claude-opus-4-8", "claude-opus-5"]
+        .iter()
+        .any(|prefix| model.starts_with(prefix))
 }
 
 /// Whether `model` should carry the `context-1m-2025-08-07` beta: an explicit
@@ -340,6 +396,17 @@ pub const CLAUDE_FABLE_MYTHOS_5_1_PRICING: FableMythosPricing = FableMythosPrici
     ..CLAUDE_FABLE_MYTHOS_5_PRICING
 };
 
+/// Opus 5.5 (`tier_4_20_cache_read_0_20`): cheaper than Opus 5 (`tier_5_25`)
+/// on every axis. Reusing the Opus 5 prefix price overstates tokens by 25% and
+/// cache reads by 2.5x.
+pub const CLAUDE_OPUS_5_5_PRICING: FableMythosPricing = FableMythosPricing {
+    input: 4.0,
+    output: 20.0,
+    cache_read: 0.2,
+    cache_write_5m: 5.0,
+    cache_write_1h: 8.0,
+};
+
 /// Cache-read-accurate pricing for any Fable/Mythos id.
 pub fn resolve_claude_fable_mythos_5_pricing(model: &str) -> FableMythosPricing {
     if is_claude_fable_or_mythos_5_point_one_model(model) {
@@ -373,7 +440,17 @@ const fn cost(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Mod
 }
 
 /// Exact-prefix pricing, matched longest-prefix-first.
-const MODEL_PRICING: [(&str, ModelCost); 5] = [
+const MODEL_PRICING: [(&str, ModelCost); 6] = [
+    // Opus 5.5 must win the longest-prefix match or it inherits Opus 5's rates.
+    (
+        CLAUDE_OPUS_5_5_MODEL_ID,
+        cost(
+            CLAUDE_OPUS_5_5_PRICING.input,
+            CLAUDE_OPUS_5_5_PRICING.output,
+            CLAUDE_OPUS_5_5_PRICING.cache_read,
+            CLAUDE_OPUS_5_5_PRICING.cache_write_5m,
+        ),
+    ),
     ("claude-opus-5", cost(5.0, 25.0, 0.5, 6.25)),
     ("claude-sonnet-5", cost(2.0, 10.0, 0.2, 2.5)),
     ("claude-opus-4", cost(5.0, 25.0, 0.5, 6.25)),
@@ -809,5 +886,195 @@ mod tests {
         ));
         assert!(is_fast_mode_supported_model("claude-opus-4-8"));
         assert!(!is_fast_mode_supported_model("claude-sonnet-5"));
+    }
+
+    /// Upstream `fast.test.ts` (eae6591): Opus 4.6/4.7 are not fast-mode
+    /// models; Opus 4.8, 5 and 5.5 (any snapshot or `[1m]` form) are.
+    #[test]
+    fn fast_mode_eligibility_matches_upstream_table() {
+        for (model, expected) in [
+            ("claude-opus-4-6", false),
+            ("claude-opus-4-7", false),
+            ("claude-opus-4-7[1m]", false),
+            ("claude-opus-4-8", true),
+            ("claude-opus-4-8-20260901", true),
+            ("claude-opus-5", true),
+            ("claude-opus-5-5", true),
+            ("claude-opus-5-5[1m]", true),
+            ("claude-sonnet-5", false),
+        ] {
+            assert_eq!(is_fast_mode_supported_model(model), expected, "{model}");
+        }
+    }
+
+    #[test]
+    fn opus_5_5_specifications_and_pricing() {
+        assert_eq!(CLAUDE_OPUS_5_5_MODEL_ID, "claude-opus-5-5");
+        assert_eq!(CLAUDE_OPUS_5_5_CONTEXT_WINDOW, 1_000_000);
+        assert_eq!(CLAUDE_OPUS_5_5_MAX_OUTPUT_TOKENS, 128_000);
+        assert_eq!(
+            CLAUDE_OPUS_5_5_PRICING,
+            FableMythosPricing {
+                input: 4.0,
+                output: 20.0,
+                cache_read: 0.2,
+                cache_write_5m: 5.0,
+                cache_write_1h: 8.0,
+            }
+        );
+        // Claude Code 2.1.280 tier_4_20_cache_read_0_20; the Opus 5 prefix
+        // must not swallow it.
+        assert_eq!(
+            resolve_model_cost("claude-opus-5-5"),
+            cost(4.0, 20.0, 0.2, 5.0)
+        );
+        assert_eq!(
+            resolve_model_cost("claude-opus-5-5-20260918"),
+            cost(4.0, 20.0, 0.2, 5.0)
+        );
+        assert_eq!(
+            resolve_model_cost("claude-opus-5"),
+            cost(5.0, 25.0, 0.5, 6.25)
+        );
+    }
+
+    #[test]
+    fn opus_5_5_predicate_matches_id_marker_and_snapshots_only() {
+        assert!(is_claude_opus_5_5_model("claude-opus-5-5"));
+        assert!(is_claude_opus_5_5_model("claude-opus-5-5[1m]"));
+        assert!(is_claude_opus_5_5_model("claude-opus-5-5-20260918"));
+        assert!(is_claude_opus_5_5_model("claude-opus-5-5-20260601"));
+        assert!(!is_claude_opus_5_5_model("claude-opus-5"));
+        assert!(!is_claude_opus_5_5_model("claude-opus-5-20260901"));
+        assert!(!is_claude_opus_5_5_model("claude-opus-4-8"));
+        assert!(!is_claude_opus_5_5_model("claude-sonnet-5"));
+        assert!(!is_claude_opus_5_5_model(""));
+        // Merged (upstream) semantics: the Opus 5 predicate excludes 5.5.
+        assert!(!is_claude_opus_5_model("claude-opus-5-5"));
+        assert!(!is_claude_opus_5_model("claude-opus-5-5-20260918"));
+        assert!(is_claude_opus_5_model("claude-opus-5-20260901"));
+        assert!(is_claude_opus_5_family_model("claude-opus-5"));
+        assert!(is_claude_opus_5_family_model("claude-opus-5-5"));
+        assert!(is_claude_opus_5_family_model("claude-opus-5-5-20260918"));
+        assert!(!is_claude_opus_5_family_model("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn opus_5_5_canonicalizes_to_its_own_id() {
+        assert_eq!(
+            canonical_claude_model_id("claude-opus-5-5"),
+            "claude-opus-5-5"
+        );
+        assert_eq!(
+            canonical_claude_model_id("claude-opus-5-5-20260601"),
+            "claude-opus-5-5"
+        );
+        assert_eq!(
+            canonical_claude_model_id("claude-opus-5-5[1m]"),
+            "claude-opus-5-5"
+        );
+    }
+
+    #[test]
+    fn opus_5_5_is_adaptive_with_every_effort_and_no_forced_budget() {
+        assert!(model_supports_adaptive_thinking("claude-opus-5-5"));
+        assert!(model_supports_max_effort("claude-opus-5-5"));
+        assert!(model_supports_xhigh_effort("claude-opus-5-5"));
+        assert_eq!(clamp_effort_for_model("max", "claude-opus-5-5"), "max");
+        assert_eq!(clamp_effort_for_model("xhigh", "claude-opus-5-5"), "xhigh");
+        assert!(!model_allows_forced_manual_thinking("claude-opus-5-5"));
+        assert_eq!(
+            resolve_thinking_shape("claude-opus-5-5", None),
+            ThinkingShape::Adaptive
+        );
+        assert_eq!(
+            resolve_thinking_shape("claude-opus-5-5", Some("1")),
+            ThinkingShape::Adaptive
+        );
+        assert!(model_injects_summarized_adaptive_thinking(
+            "claude-opus-5-5"
+        ));
+        assert!(model_supports_context_1m("claude-opus-5-5"));
+    }
+
+    #[test]
+    fn forced_tool_choice_rejection_covers_opus_5_5_and_5_1_point_releases() {
+        for model in [
+            "claude-opus-5-5",
+            "claude-opus-5-5[1m]",
+            "claude-opus-5-5-20260918",
+            "claude-fable-5-1",
+            "claude-mythos-5-1",
+        ] {
+            assert!(model_rejects_forced_tool_choice(model), "{model}");
+        }
+        for model in [
+            "claude-opus-5",
+            "claude-fable-5",
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+        ] {
+            assert!(!model_rejects_forced_tool_choice(model), "{model}");
+        }
+    }
+
+    /// Verified live 2026-09-22 (fork): Opus 5.5 answers a disabled request
+    /// with 400 "thinking.type.disabled is not supported for this model".
+    #[test]
+    fn rejects_disabled_thinking_matches_2_1_280_capability() {
+        assert!(model_rejects_disabled_thinking("claude-opus-5-5"));
+        assert!(model_rejects_disabled_thinking("claude-opus-5-5[1m]"));
+        assert!(!model_rejects_disabled_thinking("claude-opus-5"));
+        assert!(!model_rejects_disabled_thinking("claude-sonnet-5"));
+        assert!(model_rejects_disabled_thinking("claude-fable-5"));
+        assert!(model_rejects_disabled_thinking("claude-mythos-5-1"));
+        assert!(!model_rejects_disabled_thinking("claude-opus-4-8"));
+    }
+
+    /// Bun vectors from merged-TS `isClaudeOpus5Model`, `isClaudeOpus55Model`,
+    /// `isClaudeOpus5FamilyModel`, `isClaudeFableOrMythos5Model`,
+    /// `isClaudeFableOrMythos5PointOneModel`.
+    #[test]
+    fn family_predicates_match_merged_ts_vectors() {
+        for (id, expected) in [
+            ("claude-opus-5", [true, false, true, false, false]),
+            ("claude-opus-5-5", [false, true, true, false, false]),
+            ("claude-opus-5-5[1m]", [false, true, true, false, false]),
+            ("claude-opus-5[1m]", [true, false, true, false, false]),
+            ("claude-opus-5-20260901", [true, false, true, false, false]),
+            (
+                "claude-opus-5-5-20260918",
+                [false, true, true, false, false],
+            ),
+            ("Claude-Opus-5-5", [false, false, false, false, false]),
+            ("claude-opus-5-50", [true, false, true, false, false]),
+            (" claude-opus-5-5", [false, false, false, false, false]),
+            ("claude-opus-5-5[1M]", [true, false, true, false, false]),
+            ("claude-fable-5-1[1m]", [false, false, false, true, true]),
+        ] {
+            let actual = [
+                is_claude_opus_5_model(id),
+                is_claude_opus_5_5_model(id),
+                is_claude_opus_5_family_model(id),
+                is_claude_fable_or_mythos_5_model(id),
+                is_claude_fable_or_mythos_5_point_one_model(id),
+            ];
+            assert_eq!(actual, expected, "{id:?}");
+        }
+        assert_eq!(
+            normalize_anthropic_model_id("claude-opus-5[1m]"),
+            "claude-opus-5"
+        );
+        assert_eq!(
+            normalize_anthropic_model_id("claude-opus-5[1M]"),
+            "claude-opus-5[1M]"
+        );
+        // Shared 5-series behavior still covers 5.5 through the family.
+        assert!(model_injects_summarized_adaptive_thinking(
+            "claude-opus-5-5"
+        ));
+        assert!(model_injects_summarized_adaptive_thinking(
+            "claude-opus-5[1m]"
+        ));
     }
 }

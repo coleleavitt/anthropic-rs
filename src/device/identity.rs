@@ -43,6 +43,15 @@ impl DeviceId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The per-account Claude Code device id derived from this installation
+    /// secret (merged anthropic-auth: `sha256_hex(secret + "\0" + cache_key)`,
+    /// see [`crate::claude_code::derive_claude_code_device_id`]). The
+    /// installation id itself is never sent as a device id, so distinct
+    /// accounts never share one.
+    pub fn account_device_id(&self, cache_key: &str) -> String {
+        crate::claude_code::derive_claude_code_device_id(&self.0, cache_key)
+    }
 }
 
 impl std::fmt::Debug for DeviceId {
@@ -96,7 +105,8 @@ fn read_document(path: &Path) -> Result<DeviceId> {
         true,
         "device identity document",
     )?;
-    let document: DeviceDocument = serde_json::from_slice(&bytes)?;
+    let document: DeviceDocument =
+        crate::file_security::parse_json_redacted(&bytes, "device identity document")?;
     if document.version != 1 {
         return Err(Error::Protocol(format!(
             "unsupported device identity version {}",
@@ -370,6 +380,26 @@ mod tests {
         let second = store.load_or_create().unwrap();
         assert_eq!(first, second);
         assert_eq!(first.as_str().len(), 64);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Per-account ids survive a restart (re-load) and differ per account.
+    #[test]
+    fn account_device_ids_are_stable_across_restarts_and_distinct() {
+        let root = temporary_directory("per-account");
+        let path = root.join("device.json");
+        let first = DeviceIdentityStore::new(&path).load_or_create().unwrap();
+        let reloaded = DeviceIdentityStore::new(&path).load_or_create().unwrap();
+        let a = first.account_device_id("identity:acct-a");
+        assert_eq!(a, reloaded.account_device_id("identity:acct-a"));
+        assert_ne!(a, first.account_device_id("identity:acct-b"));
+        assert_ne!(a, first.as_str());
+        // Merged-TS Bun vector for a fixed secret.
+        let fixed = DeviceId::parse("a".repeat(64)).unwrap();
+        assert_eq!(
+            fixed.account_device_id("identity:acct-1"),
+            "402cc9d2902492a43d1c3e3e52b43843fc2cd9a57d057dcd8660e80da6293435"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

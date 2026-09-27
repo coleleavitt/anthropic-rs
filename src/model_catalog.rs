@@ -22,6 +22,44 @@ pub const MAX_CATALOG_PAGES: usize = 100;
 pub const MODEL_CATALOG_FETCH_TIMEOUT_SECS: u64 = 3;
 /// Effort levels the API may report.
 pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+/// How long a cached catalog is served without a refresh (six hours).
+pub const MODEL_CATALOG_MAX_AGE_MS: i64 = 6 * 60 * 60 * 1000;
+
+/// A cached catalog, keyed on the Claude Code version it was fetched under.
+///
+/// New models ship with a Claude Code release and Anthropic gates them on the
+/// declared version, so a version change invalidates the cache regardless of
+/// its age — otherwise a launch-day model (Opus 5.5 with 2.1.280) stays
+/// invisible for up to [`MODEL_CATALOG_MAX_AGE_MS`]. A cache written before the
+/// version field existed (`claude_code_version: None`) is invalidated once.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCatalogSnapshot {
+    /// Normalized entries.
+    pub models: Vec<CatalogModel>,
+    /// Fetch time, epoch milliseconds.
+    pub fetched_at: i64,
+    /// Claude Code version declared when the catalog was fetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_code_version: Option<String>,
+}
+
+impl ModelCatalogSnapshot {
+    /// Whether the snapshot may be served without waiting for a refresh:
+    /// fetched under `claude_code_version` and younger than `max_age_ms`.
+    pub fn is_fresh(&self, now_ms: i64, max_age_ms: i64, claude_code_version: &str) -> bool {
+        !self.version_changed(claude_code_version)
+            && now_ms.saturating_sub(self.fetched_at) < max_age_ms
+    }
+
+    /// Whether the snapshot was fetched under a different Claude Code version
+    /// than `claude_code_version` — known wrong rather than merely old, so the
+    /// caller should wait for the refresh (falling back to this snapshot only
+    /// if the refresh fails).
+    pub fn version_changed(&self, claude_code_version: &str) -> bool {
+        self.claude_code_version.as_deref() != Some(claude_code_version)
+    }
+}
 
 /// One normalized catalog entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -285,6 +323,46 @@ pub async fn fetch_model_catalog_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot(fetched_at: i64, version: Option<&str>) -> ModelCatalogSnapshot {
+        ModelCatalogSnapshot {
+            models: vec![],
+            fetched_at,
+            claude_code_version: version.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn catalog_freshness_is_keyed_on_age_and_claude_code_version() {
+        let now = 10_000_000;
+        let v = crate::claude_version::CLAUDE_CODE_VERSION;
+        assert!(snapshot(now, Some(v)).is_fresh(now, 1000, v));
+        assert!(!snapshot(now - 5000, Some(v)).is_fresh(now, 1000, v));
+        // A Claude Code version change invalidates an otherwise fresh cache.
+        let old = snapshot(now, Some("2.1.278"));
+        assert!(!old.is_fresh(now, 1000, "2.1.280"));
+        assert!(old.is_fresh(now, 1000, "2.1.278"));
+        assert!(old.version_changed("2.1.280"));
+        assert!(!old.version_changed("2.1.278"));
+        // A cache written before the version field existed is invalidated once.
+        assert!(!snapshot(now, None).is_fresh(now, 1000, v));
+        assert!(snapshot(now, None).version_changed(v));
+    }
+
+    #[test]
+    fn catalog_snapshot_round_trips_the_ts_cache_shape() {
+        let parsed: ModelCatalogSnapshot =
+            serde_json::from_str(r#"{"models":[],"fetchedAt":5,"claudeCodeVersion":"2.1.280"}"#)
+                .unwrap();
+        assert_eq!(parsed, snapshot(5, Some("2.1.280")));
+        let legacy: ModelCatalogSnapshot =
+            serde_json::from_str(r#"{"models":[],"fetchedAt":5}"#).unwrap();
+        assert_eq!(legacy.claude_code_version, None);
+        assert_eq!(
+            serde_json::to_string(&legacy).unwrap(),
+            r#"{"models":[],"fetchedAt":5}"#
+        );
+    }
 
     fn entry(id: &str, max_input: Option<u64>) -> serde_json::Value {
         let mut value = serde_json::json!({

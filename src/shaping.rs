@@ -5,7 +5,12 @@
 use serde_json::{Value, json};
 
 use crate::models::{
-    ThinkingShape, clamp_effort_for_model, model_injects_summarized_adaptive_thinking,
+    ThinkingShape,
+    clamp_effort_for_model,
+    is_claude_opus_5_model,
+    model_injects_summarized_adaptive_thinking,
+    model_rejects_disabled_thinking,
+    model_rejects_forced_tool_choice,
     resolve_thinking_shape,
 };
 
@@ -147,6 +152,89 @@ pub fn apply_thinking_plan(body: &mut Value, plan: &ThinkingPlan) {
     }
 }
 
+/// What [`enforce_model_request_constraints`] changed in a body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ModelConstraintFixups {
+    /// A forced `tool_choice` (`any`/`tool`) was removed; `tools` are kept.
+    pub removed_forced_tool_choice: bool,
+    /// A `thinking` shape the model rejects was rewritten to
+    /// `{type:"adaptive",display:"summarized"}`.
+    pub rewrote_thinking: bool,
+    /// `output_config.effort` was lowered to `high` to pair with a disabled
+    /// thinking field on Opus 5.
+    pub capped_effort: bool,
+}
+
+/// Rewrite the request fields a model is known to reject with HTTP 400,
+/// leaving everything else untouched:
+///
+/// - Opus 5.5 and Fable/Mythos 5.1 reject a forced `tool_choice`
+///   (`{type:"any"}`, `{type:"tool"}`) — it is removed, the tools stay
+///   declared, and the model may still call them (upstream `eae6591`);
+/// - models with `rejects_disabled_thinking` (Opus 5.5, Fable/Mythos) reject
+///   `thinking:{type:"disabled"}` and a manual `budget_tokens` shape — both
+///   become adaptive summarized (Claude Code 2.1.280 never sends a disable to
+///   Opus 5.5);
+/// - Opus 5 accepts a disable only at effort `high` or below, so a disabled
+///   thinking field caps `output_config.effort` `xhigh`/`max` to `high` and is
+///   canonicalized to a bare `{type:"disabled"}`.
+///
+/// Non-object bodies and bodies without a string `model` are left alone.
+pub fn enforce_model_request_constraints(body: &mut Value) -> ModelConstraintFixups {
+    let mut fixups = ModelConstraintFixups::default();
+    let Some(object) = body.as_object_mut() else {
+        return fixups;
+    };
+    let Some(model) = object
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return fixups;
+    };
+    if model_rejects_forced_tool_choice(&model) {
+        let forced = object
+            .get("tool_choice")
+            .and_then(|c| c.get("type"))
+            .and_then(Value::as_str)
+            .is_some_and(|t| t == "any" || t == "tool");
+        if forced {
+            object.remove("tool_choice");
+            fixups.removed_forced_tool_choice = true;
+        }
+    }
+    let thinking_type = object
+        .get("thinking")
+        .and_then(|t| t.get("type"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if model_rejects_disabled_thinking(&model) {
+        if matches!(thinking_type.as_deref(), Some("disabled" | "enabled")) {
+            object.insert(
+                "thinking".into(),
+                json!({"type": "adaptive", "display": "summarized"}),
+            );
+            fixups.rewrote_thinking = true;
+        }
+    } else if is_claude_opus_5_model(&model) && thinking_type.as_deref() == Some("disabled") {
+        object.insert("thinking".into(), json!({"type": "disabled"}));
+        let config = object
+            .get_mut("output_config")
+            .and_then(Value::as_object_mut)
+            .filter(|c| {
+                matches!(
+                    c.get("effort").and_then(Value::as_str),
+                    Some("xhigh" | "max")
+                )
+            });
+        if let Some(config) = config {
+            config.insert("effort".into(), Value::String("high".into()));
+            fixups.capped_effort = true;
+        }
+    }
+    fixups
+}
+
 /// Place the ephemeral prompt-cache breakpoints: on the last tool, the last
 /// system block, and the final user turn.
 ///
@@ -255,6 +343,92 @@ pub fn from_wire_tool_name<'a>(name: &'a str, declared_tools: &[&'a str]) -> &'a
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream `transform.test.ts` (eae6591): Opus 5.5 drops forced tool
+    /// choice without dropping tools; `auto`/`none` and Opus 5 are untouched.
+    #[test]
+    fn opus_5_5_removes_forced_tool_choice_but_keeps_tools() {
+        for (model, choice) in [
+            ("claude-opus-5-5", json!({"type": "any"})),
+            ("claude-opus-5-5[1m]", json!({"type": "any"})),
+            (
+                "claude-opus-5-5-20260918",
+                json!({"type": "tool", "name": "StructuredOutput"}),
+            ),
+            ("claude-fable-5-1", json!({"type": "tool", "name": "x"})),
+        ] {
+            let mut body = json!({"model": model, "tools": [{"name": "StructuredOutput"}], "tool_choice": choice});
+            let fixups = enforce_model_request_constraints(&mut body);
+            assert!(fixups.removed_forced_tool_choice, "{model}");
+            assert!(body.get("tool_choice").is_none(), "{model}");
+            assert_eq!(body["tools"].as_array().map(Vec::len), Some(1));
+        }
+        for kind in ["auto", "none"] {
+            let mut body = json!({"model": "claude-opus-5-5", "tool_choice": {"type": kind}});
+            assert!(!enforce_model_request_constraints(&mut body).removed_forced_tool_choice);
+            assert_eq!(body["tool_choice"], json!({"type": kind}));
+        }
+        let mut opus5 = json!({"model": "claude-opus-5", "tool_choice": {"type": "any"}});
+        enforce_model_request_constraints(&mut opus5);
+        assert_eq!(opus5["tool_choice"], json!({"type": "any"}));
+    }
+
+    #[test]
+    fn opus_5_5_rewrites_disabled_and_budget_thinking_to_adaptive() {
+        for thinking in [
+            json!({"type": "disabled"}),
+            json!({"type": "enabled", "budget_tokens": 4096}),
+        ] {
+            let mut body = json!({"model": "claude-opus-5-5", "thinking": thinking});
+            let fixups = enforce_model_request_constraints(&mut body);
+            assert!(fixups.rewrote_thinking);
+            assert_eq!(
+                body["thinking"],
+                json!({"type": "adaptive", "display": "summarized"})
+            );
+        }
+        let mut fable = json!({"model": "claude-fable-5", "thinking": {"type": "disabled"}});
+        assert!(enforce_model_request_constraints(&mut fable).rewrote_thinking);
+        // Already adaptive, or absent: untouched.
+        let mut adaptive = json!({"model": "claude-opus-5-5", "thinking": {"type": "adaptive"}});
+        assert_eq!(
+            enforce_model_request_constraints(&mut adaptive),
+            ModelConstraintFixups::default()
+        );
+        let mut absent = json!({"model": "claude-opus-5-5"});
+        enforce_model_request_constraints(&mut absent);
+        assert!(absent.get("thinking").is_none());
+    }
+
+    #[test]
+    fn opus_5_disabled_thinking_caps_effort_at_high() {
+        let mut body = json!({
+            "model": "claude-opus-5",
+            "thinking": {"type": "disabled", "display": "summarized"},
+            "output_config": {"effort": "max"}
+        });
+        let fixups = enforce_model_request_constraints(&mut body);
+        assert!(fixups.capped_effort && !fixups.rewrote_thinking);
+        assert_eq!(body["thinking"], json!({"type": "disabled"}));
+        assert_eq!(body["output_config"]["effort"], "high");
+        let mut medium = json!({
+            "model": "claude-opus-5",
+            "thinking": {"type": "disabled"},
+            "output_config": {"effort": "medium"}
+        });
+        assert!(!enforce_model_request_constraints(&mut medium).capped_effort);
+        assert_eq!(medium["output_config"]["effort"], "medium");
+        // Sonnet 5 accepts a disable; nothing changes.
+        let mut sonnet = json!({"model": "claude-sonnet-5", "thinking": {"type": "disabled"}, "output_config": {"effort": "max"}});
+        assert_eq!(
+            enforce_model_request_constraints(&mut sonnet),
+            ModelConstraintFixups::default()
+        );
+        assert_eq!(
+            enforce_model_request_constraints(&mut json!([])),
+            ModelConstraintFixups::default()
+        );
+    }
 
     fn request(model: &str, reasoning: Option<ReasoningLevel>) -> ThinkingRequest<'_> {
         ThinkingRequest {

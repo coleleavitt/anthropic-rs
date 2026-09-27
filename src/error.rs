@@ -126,6 +126,28 @@ pub enum Error {
     /// Device key generation, encoding, or signing failed.
     #[error("device cryptography error: {0}")]
     Crypto(String),
+
+    /// A credential is a vault-custody tombstone (`claustrum-tombstone:v1:*`):
+    /// a non-secret marker left where a vaulted credential used to live. It
+    /// must never be presented to the token endpoint or sent as a bearer.
+    #[error("{provider} OAuth credentials are vault-custodied; local token use is forbidden")]
+    CustodyTombstone {
+        /// Provider named by the tombstone (e.g. `anthropic`), when known.
+        provider: String,
+    },
+
+    /// A private JSON document (credential store, native credential file,
+    /// device identity) is corrupt. Carries only the position: parser text
+    /// can echo token bytes and is never surfaced.
+    #[error("{what} is not valid JSON (line {line}, column {column})")]
+    InvalidJson {
+        /// Which document failed to parse.
+        what: &'static str,
+        /// 1-based line of the failure.
+        line: usize,
+        /// 1-based column of the failure.
+        column: usize,
+    },
 }
 
 #[cfg(feature = "client")]
@@ -186,7 +208,8 @@ impl Error {
             | Error::Url(_)
             | Error::Protocol(_)
             | Error::Callback(_)
-            | Error::Crypto(_) => true,
+            | Error::Crypto(_)
+            | Error::CustodyTombstone { .. } => true,
             Error::NoUsableAccount(_)
             | Error::RefreshRefused(_)
             | Error::Io(_)
@@ -196,6 +219,8 @@ impl Error {
             #[cfg(feature = "client")]
             Error::Http(_) => false,
             Error::Serde(_) => false,
+            // Same retry class as `Serde`, which it replaces for private documents.
+            Error::InvalidJson { .. } => false,
         }
     }
 

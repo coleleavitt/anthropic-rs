@@ -224,7 +224,13 @@ impl Account {
 
     /// Replace the stored OAuth session and synchronize derived account
     /// metadata from the token payload.
+    ///
+    /// A custody tombstone (`claustrum-tombstone:v1:*`) is refused: the merged
+    /// anthropic-auth never mirrors a host's tombstone into the shared account
+    /// store, where other apps would present it.
     pub fn replace_oauth_tokens(&mut self, tokens: OAuthTokens) -> Result<()> {
+        crate::token::ensure_not_custody_tombstone(tokens.refresh.expose(), "anthropic")?;
+        crate::token::ensure_not_custody_tombstone(tokens.access.expose(), "anthropic")?;
         let email = oauth_email(&tokens);
         let Credential::Oauth(current) = &mut self.credential else {
             return Err(Error::Protocol(format!(
@@ -413,6 +419,26 @@ mod tests {
             })
             .unwrap();
         assert_eq!(account.email.as_deref(), Some("second@example.com"));
+
+        // Merge post-fix: a custody tombstone is never mirrored into the
+        // shared store; the live session is left untouched.
+        let refused = account.replace_oauth_tokens(OAuthTokens {
+            access: AccessToken::new(""),
+            refresh: RefreshToken::new("claustrum-tombstone:v1:anthropic"),
+            expires_at: at(1_700_000_200),
+            refresh_expires_at: None,
+            scopes: Vec::new(),
+            account: None,
+            organization: None,
+        });
+        assert!(matches!(
+            refused,
+            Err(crate::Error::CustodyTombstone { .. })
+        ));
+        assert_eq!(
+            account.oauth().map(|t| t.refresh.expose().to_owned()),
+            Some("sk-ant-ort01-bbbbbbbbbbbbbbbbbbbbbb".to_owned())
+        );
     }
 
     #[test]

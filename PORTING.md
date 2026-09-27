@@ -81,3 +81,20 @@ Existing `oauth.rs`, `token.rs`, `store.rs`, `request.rs`, and `endpoints.rs` re
 | 2.1.233 CCH seed/preimage | `cch` native-oracle vector tests |
 
 No port is complete until its corresponding test is present and `cargo test --all-features` passes.
+
+## 2.1.280 / TS sync f74d736
+
+Source of truth: anthropic-auth merge `f74d736` (`sync/upstream-2026-09-26`), `packages/core/src`, and the merge decisions at the top of `docs/TS_SYNC_2026-09-26.md`. Fixed vectors were produced by running the merged TS under Bun.
+
+| Merge decision | Rust | Tests |
+|---|---|---|
+| cch: upstream canonical signing is the default | `cch::sign_request_body` = TS `signRequestBody` (TS pattern with header as `system[0]`, reset slot, top-level `model:""` / no `max_tokens`, `JSON.stringify`-exact re-serialization via `cch::js_json_stringify`, xxHash64 seed `0x4d659218e32a3268`, 20-bit mask). `CchMode` = `Native` (default) / `Literal` / `Hmac` / `Xxhash`, env `ANTHROPIC_AUTH_CCH_MODE`. The global 2.1.233 transform is kept as `sign_request_body_2_1_233` for diagnostics only. | `cch::tests::*` |
+| Billing header order and lineage | `billing::build_billing_header_value`: `cc_workload`, `cc_is_subagent`, then `cc_prev_req` (`^req_[A-Za-z0-9_-]{8,128}$`), `cc_prompt_id` (UUID v1–8, variant 8–b). First user text: `<command-name>` block, else the last non-empty text block; `FirstUserTextTracker` pins it per session (LRU 1000). `strip_billing_lineage_fields` / `strip_billing_lineage_from_body`. | `billing::tests::*` |
+| Betas | `claude_code::CLAUDE_CODE_{FULL_AGENT,STRUCTURED_OUTPUT,BASE}_BETAS` = upstream tuples (base has no `claude-code-20250219`); then fast, `effort-2025-11-24` whenever `output_config.effort` is present, `context-1m` unless suppressed, then extras. Fork headers kept; env-forwarded headers via `claude_code_env_headers`. | `beta_selection_matches_merged_ts_vectors`, `env_forwarded_headers_are_encoded_and_optional` |
+| Device identity | `claude_code::derive_claude_code_device_id(secret, cache_key)` = `sha256_hex(secret + "\0" + key)`, keys from `claude_code_identity_cache_key` (`identity:<id>` / `compat:<token>`); `DeviceId::account_device_id`. The installation id is never sent directly. | `per_account_device_id_matches_merged_ts`, `account_device_ids_are_stable_across_restarts_and_distinct` |
+| Models | `is_claude_opus_5_model` excludes `claude-opus-5-5`; `is_claude_opus_5_family_model` for shared behavior (summarized adaptive injection). Family predicates strip one trailing `[1m]` (`normalize_anthropic_model_id`), exact-case like upstream. Fast mode = `claude-opus-4-8*` / `claude-opus-5*`. Opus 5.5 pricing 4/20/0.2, cache write 5m 5, 1h 8. | `family_predicates_match_merged_ts_vectors`, `fast_mode_eligibility_matches_upstream_table`, `opus_5_5_specifications_and_pricing` |
+| Transient network codes | `backoff::TRANSIENT_NETWORK_ERROR_CODES` = the 18-code union; `BrokenPipe` / `NetworkDown` I/O kinds. | `messages_are_redacted_and_network_codes_recognized` |
+| Killswitch 429 | `killswitch::killswitch_block_response`: 429, `retry-after: 60`, `x-should-retry: false`. | `synthesized_block_is_not_retryable` |
+| Tombstones never mirrored | `Account::replace_oauth_tokens` refuses `claustrum-tombstone:v1:*`. | `replacing_oauth_tokens_keeps_account_email_in_sync` |
+
+Not applicable here: the account-lineage handoff (the Rust store keys accounts by a stable id and never had the fork's refresh-fingerprint handoff); the pre-send primary quota probe and scoped custody (no main/fallback split, no Claustrum client); bootstrap `/api/claude_cli/bootstrap` lookups. Excluded by decision: the refusal / content-filter / surrogate / session-heat / context-sanitizer layer, OpenCode/Pi host glue, and the Claustrum custody client.

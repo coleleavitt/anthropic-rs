@@ -17,7 +17,12 @@ use serde::Deserialize;
 
 use crate::account::Account;
 use crate::token::{
-    AccessToken, Credential, OAuthTokens, RefreshToken, TokenAccount, TokenOrganization,
+    AccessToken,
+    Credential,
+    OAuthTokens,
+    RefreshToken,
+    TokenAccount,
+    TokenOrganization,
     redact_secrets,
 };
 
@@ -80,6 +85,12 @@ impl LegacyAccount {
         // A row stripped of its refresh token can never obtain a working access
         // token again; adopting it would only add a permanently failing route.
         let refresh = non_empty(self.refresh_token)?;
+        // A custody tombstone is a vault marker, never an importable credential.
+        if crate::token::is_custody_tombstone(&access)
+            || crate::token::is_custody_tombstone(&refresh)
+        {
+            return None;
+        }
 
         let email = non_empty(self.email);
         let organization = non_empty(self.organization_uuid).map(|uuid| TokenOrganization { uuid });
@@ -155,6 +166,15 @@ mod tests {
             "organizationUuid": "66666666-7777-8888-9999-000000000000",
             "enabled": true,
         })
+    }
+
+    #[test]
+    fn never_adopts_a_custody_tombstone() {
+        let mut row = flat_row();
+        row["refreshToken"] = serde_json::json!("claustrum-tombstone:v1:anthropic");
+        let store: LegacyStore =
+            serde_json::from_value(serde_json::json!({ "accounts": [row] })).unwrap();
+        assert!(store.into_accounts().is_empty());
     }
 
     #[test]
