@@ -1,6 +1,8 @@
 // Smoke test for the native binding. Runs entirely against a temp store and
 // local mock servers; it never touches ~/.anthropic-accounts or any real
-// Anthropic endpoint. Run with `bun test test/` after `npm run build`.
+// Anthropic endpoint. Run with `bun test test/` after `npm run build`;
+// test/preload.ts (via bunfig.toml) turns on OAuth test mode and parks every
+// default OAuth URL on a dead loopback port first.
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -367,5 +369,43 @@ describe('keepAliveOnce and 401 recovery', () => {
     expect(recovered.token.accessToken).toMatch(/^sk-ant-oat01-rotated/)
     expect(JSON.stringify(recovered)).not.toContain('sk-ant-ort01')
     expect(presented).toEqual([OLD_REFRESH])
+  })
+})
+
+describe('OAuth test mode (preload)', () => {
+  test('the preload reaches the addon: test mode on, defaults on a dead loopback', () => {
+    // Bun's process.env writes do not reach the native getenv; index.js
+    // forwards a snapshot. If that ever broke, these would show production.
+    const a = new AnthropicAuth({ storePath: join(sandbox, 'probe.json') })
+    expect(a.testMode).toBe(true)
+    expect(a.startLogin().url.startsWith('http://127.0.0.1:9/cai/oauth/authorize?')).toBe(true)
+    expect(a.startLogin({ mode: 'console' }).url.startsWith('http://127.0.0.1:9/oauth/authorize?')).toBe(true)
+  })
+
+  test('a handle without tokenUrl refreshes against the dead loopback, never production', async () => {
+    seed([oauthRow('main')])
+    const a = new AnthropicAuth({ storePath })
+    expect(a.testMode).toBe(true)
+    await expectCode(a.getAccessToken(), 'transient')
+    expect(presented.length).toBe(0)
+    // Nothing was spent or marked dead.
+    const row = readStore().accounts[0]
+    expect(row.credential.refresh).toBe(OLD_REFRESH)
+    expect(row.dead_refresh_fingerprint).toBeUndefined()
+  })
+
+  test('a non-loopback token URL fails closed with config before any byte is sent', async () => {
+    seed([oauthRow('main', { expiresIn: 4 * HOUR })])
+    const a = new AnthropicAuth({ storePath, tokenUrl: 'https://platform.claude.com/v1/oauth/token' })
+    const failed = await a.handleUnauthorized({ accessToken: OLD_ACCESS })
+    expect(failed.retry).toBe(false)
+    expect(failed.failureCode).toBe('config')
+    seed([oauthRow('main')])
+    await expectCode(a.getAccessToken(), 'config')
+    const login = a.startLogin()
+    await expectCode(a.completeLogin({ loginId: login.loginId, callback: `the-code#${login.state}` }), 'config')
+    expect(presented.length).toBe(0)
+    expect(codeExchanges.length).toBe(1)
+    expect(readStore().accounts[0].credential.refresh).toBe(OLD_REFRESH)
   })
 })

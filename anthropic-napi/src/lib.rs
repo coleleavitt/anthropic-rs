@@ -89,7 +89,13 @@ async fn blocking<T: Send + 'static>(
 /// Where the binding reads and writes, and which endpoints it talks to. Every
 /// field is optional; the defaults are the shared store
 /// (`$ANTHROPIC_ACCOUNTS_FILE`, `$ANTHROPIC_ACCOUNTS_DIR/accounts.json`, else
-/// `~/.anthropic-accounts/accounts.json`) and the production endpoints.
+/// `~/.anthropic-accounts/accounts.json`) and `anthropic::Endpoints::from_env`
+/// (production unless `ANTHROPIC_OAUTH_TOKEN_URL`,
+/// `ANTHROPIC_OAUTH_REVOKE_URL`, `ANTHROPIC_OAUTH_AUTHORIZE_URL`,
+/// `ANTHROPIC_OAUTH_CONSOLE_AUTHORIZE_URL`, `ANTHROPIC_OAUTH_REDIRECT_URI`,
+/// `ANTHROPIC_OAUTH_USAGE_URL` or `CLAUDE_CODE_OAUTH_CLIENT_ID` override it).
+/// With `ANTHROPIC_OAUTH_TEST_MODE=1`, any OAuth call to a non-loopback host
+/// fails with code `config` before a byte is sent.
 #[napi(object)]
 #[derive(Default)]
 pub struct AuthConfig {
@@ -425,12 +431,48 @@ pub struct AnthropicAuth {
     path: PathBuf,
     endpoints: Endpoints,
     console_authorize_url: String,
+    test_mode: bool,
     logins: Arc<Mutex<HashMap<String, PendingLogin>>>,
 }
 
 impl AnthropicAuth {
     fn client(&self) -> OAuthClient {
-        OAuthClient::new(self.endpoints.clone())
+        OAuthClient::new(self.endpoints.clone()).require_loopback(self.test_mode)
+    }
+}
+
+/// The host's view of the environment, passed by `index.js` as a snapshot of
+/// `process.env` (Bun's `process.env` writes do not reach the native
+/// `getenv`, so the addon cannot rely on `std::env` alone). A snapshot value
+/// wins; a key absent from it falls back to the process environment.
+struct HostEnv(HashMap<String, String>);
+
+impl HostEnv {
+    fn get(&self, key: &str) -> Option<String> {
+        self.0
+            .get(key)
+            .cloned()
+            .or_else(|| std::env::var(key).ok())
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    }
+
+    /// `$ANTHROPIC_ACCOUNTS_FILE`, else `$ANTHROPIC_ACCOUNTS_DIR/accounts.json`,
+    /// else `$HOME/.anthropic-accounts/accounts.json`, resolved through this
+    /// view (the crate's `default_store_path` as the last resort).
+    fn store_path(&self) -> PathBuf {
+        if let Some(file) = self.get(anthropic::store::STORE_FILE_ENV) {
+            return PathBuf::from(file);
+        }
+        if let Some(dir) = self.get(anthropic::store::STORE_DIR_ENV) {
+            return PathBuf::from(dir).join(anthropic::store::STORE_FILE_NAME);
+        }
+        if let Some(home) = self.get("HOME") {
+            return PathBuf::from(home)
+                .join(anthropic::store::STORE_DIR_NAME)
+                .join(anthropic::store::STORE_FILE_NAME);
+        }
+        anthropic::default_store_path()
     }
 }
 
@@ -439,15 +481,30 @@ impl AnthropicAuth {
     /// Open the store at `options.storePath` (default: the shared store).
     /// Validates the configuration; nothing is read until a method runs.
     #[napi(constructor)]
-    pub fn new(options: Option<AuthConfig>) -> napi::Result<Self> {
+    ///
+    /// `env` is the loader's snapshot of `process.env` (see `index.js`); it
+    /// feeds the same resolution as `Endpoints::from_env`.
+    pub fn new(
+        options: Option<AuthConfig>,
+        env: Option<HashMap<String, String>>,
+    ) -> napi::Result<Self> {
         let cfg = options.unwrap_or_default();
+        let host = HostEnv(env.unwrap_or_default());
         let path = match cfg.store_path.as_deref().map(str::trim) {
             Some("") => return Err(config_error("storePath is empty")),
             Some(path) => PathBuf::from(path),
-            None => anthropic::default_store_path(),
+            None => host.store_path(),
         };
-        let mut endpoints = Endpoints::from_env();
-        let mut console_authorize_url = Endpoints::console().authorize_url;
+        // The crate's one endpoint resolver (ANTHROPIC_OAUTH_*_URL,
+        // CLAUDE_CODE_OAUTH_CLIENT_ID, ANTHROPIC_BASE_URL) over the host's
+        // environment; explicit options win over it.
+        let mut endpoints = Endpoints::from_lookup(|key| host.get(key));
+        let mut console_authorize_url =
+            Endpoints::console_from_lookup(|key| host.get(key)).authorize_url;
+        let test_mode = anthropic::endpoints::oauth_test_mode_value(
+            host.get(anthropic::endpoints::OAUTH_TEST_MODE_ENV)
+                .as_deref(),
+        );
         for (value, slot) in [
             (cfg.token_url, &mut endpoints.token_url),
             (cfg.authorize_url, &mut endpoints.authorize_url),
@@ -474,8 +531,16 @@ impl AnthropicAuth {
             path,
             endpoints,
             console_authorize_url,
+            test_mode,
             logins: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Whether this handle refuses OAuth calls to non-loopback hosts
+    /// (`ANTHROPIC_OAUTH_TEST_MODE`, from the host env or the process env).
+    #[napi(getter)]
+    pub fn test_mode(&self) -> bool {
+        self.test_mode || anthropic::endpoints::oauth_test_mode()
     }
 
     /// The store file this handle uses.
@@ -821,7 +886,7 @@ impl AnthropicAuth {
         let (code, state) = parse_callback(&options.callback, &pending.state)?;
         let code = anthropic::parse_redirect_code(&format!("{code}#{state}"), &pending.state)
             .map_err(|e| from_crate(&e))?;
-        let client = OAuthClient::new(pending.endpoints);
+        let client = OAuthClient::new(pending.endpoints).require_loopback(self.test_mode);
         let tokens = client
             .exchange_code(&code, &pending.verifier, &pending.state)
             .await

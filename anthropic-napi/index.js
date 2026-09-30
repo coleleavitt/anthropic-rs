@@ -52,10 +52,39 @@ function loadNative() {
 const native = loadNative()
 const inner = new WeakMap()
 
+// Environment the addon resolves endpoints, the default store and OAuth test
+// mode from (the same keys as the Rust `Endpoints::from_env`). Passed as a
+// snapshot because Bun's `process.env` writes never reach the native
+// `getenv`: without this a test preload that sets `process.env` would be
+// invisible to Rust, and a forgotten `tokenUrl` would reach production.
+const ENV_KEYS = [
+  'ANTHROPIC_OAUTH_TEST_MODE',
+  'ANTHROPIC_OAUTH_TOKEN_URL',
+  'ANTHROPIC_OAUTH_REVOKE_URL',
+  'ANTHROPIC_OAUTH_AUTHORIZE_URL',
+  'ANTHROPIC_OAUTH_CONSOLE_AUTHORIZE_URL',
+  'ANTHROPIC_OAUTH_REDIRECT_URI',
+  'ANTHROPIC_OAUTH_USAGE_URL',
+  'CLAUDE_CODE_OAUTH_CLIENT_ID',
+  'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_ACCOUNTS_FILE',
+  'ANTHROPIC_ACCOUNTS_DIR',
+  'HOME',
+]
+
+function envSnapshot() {
+  const out = {}
+  for (const key of ENV_KEYS) {
+    const value = process.env[key]
+    if (typeof value === 'string') out[key] = value
+  }
+  return out
+}
+
 class AnthropicAuth {
   constructor(config) {
     try {
-      inner.set(this, new native.AnthropicAuth(config))
+      inner.set(this, new native.AnthropicAuth(config, envSnapshot()))
     } catch (error) {
       throw translate(error)
     }
@@ -63,6 +92,10 @@ class AnthropicAuth {
 
   get storePath() {
     return inner.get(this).storePath
+  }
+
+  get testMode() {
+    return inner.get(this).testMode
   }
 }
 

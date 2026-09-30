@@ -1,0 +1,5 @@
+# `bun test` loads test/preload.ts before any test file: OAuth test mode on and
+# every OAuth URL on a dead loopback port, so a handle that forgets `tokenUrl`
+# can never present a fixture refresh token to production.
+[test]
+preload = ["./test/preload.ts"]

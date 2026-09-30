@@ -23,13 +23,21 @@ export declare class AnthropicAuthError extends Error {
    * - `auth_required`: no account can serve (none, none matching, all disabled); log in.
    * - `quota_reserve`: every otherwise usable account is at/above the reserve or exhausted.
    * - `invalid_grant`: every refreshable account's refresh token is dead/expired; re-login.
-   * - `config`: unusable store or option.
+   * - `config`: unusable store or option, or OAuth test mode refused a non-loopback host.
    * - `transient`: retry later (rate limit, refresh claim held elsewhere, network, timeout).
    */
   readonly code: ErrorCode
 }
 
-/** Store location and endpoint overrides. All optional. */
+/**
+ * Store location and endpoint overrides. All optional. Unset endpoints come
+ * from the environment (`ANTHROPIC_OAUTH_TOKEN_URL`, `ANTHROPIC_OAUTH_REVOKE_URL`,
+ * `ANTHROPIC_OAUTH_AUTHORIZE_URL`, `ANTHROPIC_OAUTH_CONSOLE_AUTHORIZE_URL`,
+ * `ANTHROPIC_OAUTH_REDIRECT_URI`, `ANTHROPIC_OAUTH_USAGE_URL`,
+ * `CLAUDE_CODE_OAUTH_CLIENT_ID`), else production. With
+ * `ANTHROPIC_OAUTH_TEST_MODE=1` any OAuth call to a non-loopback host fails
+ * with code `config` before a byte is sent.
+ */
 export interface AuthConfig {
   /**
    * Store file. Default: `$ANTHROPIC_ACCOUNTS_FILE`, else
@@ -220,6 +228,8 @@ export interface UnauthorizedResult {
 export declare class AnthropicAuth {
   constructor(config?: AuthConfig | null)
   readonly storePath: string
+  /** Whether OAuth calls to non-loopback hosts are refused (`ANTHROPIC_OAUTH_TEST_MODE`). */
+  readonly testMode: boolean
   /** Every row, non-secret fields only. */
   listAccounts(): Promise<AccountInfo[]>
   /**
