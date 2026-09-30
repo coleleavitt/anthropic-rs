@@ -243,7 +243,7 @@ mod tests {
             version: 1,
             accounts,
             current: None,
-            migrated_from: Vec::new(),
+            ..AccountStore::default()
         }
     }
 

@@ -490,7 +490,7 @@ mod tests {
             version: 1,
             accounts: vec![Account::new("shared", Credential::Oauth(presented.clone()))],
             current: Some("shared".into()),
-            migrated_from: Vec::new(),
+            ..AccountStore::default()
         };
         store.save(path).unwrap();
         store

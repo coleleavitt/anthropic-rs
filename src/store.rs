@@ -63,6 +63,10 @@ pub struct AccountStore {
     /// adoption is recorded rather than repeated.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub migrated_from: Vec<String>,
+    /// Top-level fields this crate does not model, preserved verbatim so a
+    /// write never drops another writer's data.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn default_version() -> u32 {
@@ -231,6 +235,7 @@ impl AccountStore {
         let mut seen: HashSet<String> =
             store.accounts.iter().flat_map(account_identities).collect();
         let mut adopted: Vec<PathBuf> = Vec::new();
+        let mut scanned: Vec<PathBuf> = Vec::new();
 
         for candidate in legacy {
             if candidate == canonical || already.contains(&candidate.to_string_lossy().to_string())
@@ -246,6 +251,10 @@ impl AccountStore {
             let Ok(accounts) = Self::read_legacy(candidate) else {
                 continue;
             };
+            // Recorded even when every row was skipped (duplicates, or rows
+            // dead by definition), so the file is not re-scanned on every
+            // load and a later identity drift cannot re-import its rows.
+            scanned.push(candidate.clone());
             if accounts.is_empty() {
                 continue;
             }
@@ -268,15 +277,14 @@ impl AccountStore {
         }
 
         store.migrated_from.extend(
-            adopted
+            scanned
                 .iter()
                 .map(|path| path.to_string_lossy().to_string()),
         );
 
-        let source = if canonical_exists {
-            LoadSource::Canonical(canonical.to_path_buf())
-        } else {
-            LoadSource::Legacy(adopted[0].clone())
+        let source = match adopted.first() {
+            Some(first) if !canonical_exists => LoadSource::Legacy(first.clone()),
+            _ => LoadSource::Canonical(canonical.to_path_buf()),
         };
         Ok(Loaded { store, source })
     }
@@ -301,6 +309,12 @@ impl AccountStore {
     }
 
     /// Persist to `path` atomically.
+    ///
+    /// This is a **snapshot overwrite**: whatever another process wrote since
+    /// `self` was loaded is lost, including token rotations. Prefer
+    /// [`Self::mutate`] (re-read under the lock) for every update, and
+    /// [`Self::merge_adopted`] to persist rows found by
+    /// [`Self::load_or_migrate`].
     ///
     /// Refuses to write an empty account list: an empty store is nearly always
     /// a bug upstream, and committing it would wipe the user's credentials.
@@ -339,19 +353,115 @@ impl AccountStore {
         update: impl FnOnce(&mut Self) -> Result<R>,
     ) -> Result<R> {
         let _lock = StoreLock::acquire(path, STORE_LOCK_WAIT)?;
-        let mut store = match std::fs::symlink_metadata(path) {
-            Ok(_) => Self::load(path)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(error) => return Err(error.into()),
-        };
+        let mut store = Self::load_if_present(path)?;
+        // Stale errors (bound to a token the row no longer holds, or an
+        // unbound `invalid_grant` with no dead-token record) clear themselves
+        // on the next locked write, whoever makes it.
+        for account in &mut store.accounts {
+            account.clear_stale_error();
+        }
         let output = update(&mut store)?;
         store.save_unlocked(path, allow_empty)?;
         Ok(output)
     }
 
+    fn load_if_present(path: &Path) -> Result<Self> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => Self::load(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Read the store under its inter-process lock without writing it back.
+    /// Use it when a decision must see the latest committed state (for
+    /// example, which refresh token the store holds right now) but nothing
+    /// needs to change.
+    pub fn read_locked<R>(path: &Path, read: impl FnOnce(&Self) -> Result<R>) -> Result<R> {
+        let _lock = StoreLock::acquire(path, STORE_LOCK_WAIT)?;
+        let store = Self::load_if_present(path)?;
+        read(&store)
+    }
+
+    /// Persist accounts adopted from legacy stores (see
+    /// [`Self::load_or_migrate_from`]) without overwriting anything: under the
+    /// lock, each row is appended only when none of its identities is already
+    /// present, and the scanned legacy paths are recorded. Returns how many
+    /// rows were added.
+    pub fn merge_adopted(path: &Path, loaded: &Self) -> Result<usize> {
+        Self::mutate(path, |store| {
+            let mut seen: HashSet<String> =
+                store.accounts.iter().flat_map(account_identities).collect();
+            let mut added = 0;
+            for account in &loaded.accounts {
+                let identities = account_identities(account);
+                if identities.iter().any(|key| seen.contains(key)) {
+                    continue;
+                }
+                seen.extend(identities);
+                store.accounts.push(account.clone());
+                added += 1;
+            }
+            for path in &loaded.migrated_from {
+                if !store.migrated_from.contains(path) {
+                    store.migrated_from.push(path.clone());
+                }
+            }
+            Ok(added)
+        })
+    }
+
+    /// Install a freshly logged-in credential. When a row already holds the
+    /// same login (any shared identity: id, account uuid + organization,
+    /// email + organization, token), that row is updated **in place**: its
+    /// credential is replaced, it is re-enabled, and records bound to the old
+    /// token (error, dead-token verdict, refresh claim, cooldown) are cleared,
+    /// while its id, label, quota, pin and unknown fields are kept. Otherwise
+    /// `account` is appended. Returns the id of the row that now holds the
+    /// login.
+    pub fn merge_login(&mut self, account: Account) -> Result<String> {
+        let incoming: HashSet<String> = account_identities(&account).into_iter().collect();
+        let Some(existing) = self.accounts.iter_mut().find(|candidate| {
+            account_identities(candidate)
+                .iter()
+                .any(|key| incoming.contains(key))
+        }) else {
+            let id = account.id.clone();
+            self.accounts.push(account);
+            return Ok(id);
+        };
+        match (&mut existing.credential, account.credential) {
+            (Credential::Oauth(_), Credential::Oauth(tokens)) => {
+                existing.replace_oauth_tokens(tokens)?;
+            }
+            (_, credential) => {
+                existing.credential = credential;
+                existing.credential_extra = serde_json::Map::new();
+            }
+        }
+        if account.label.is_some() {
+            existing.label = account.label;
+        }
+        if account.email.is_some() {
+            existing.email = account.email;
+        }
+        existing.enabled = true;
+        existing.rate_limited_until = None;
+        existing.clear_error();
+        existing.dead_refresh_fingerprint = None;
+        existing.refresh_lease = None;
+        Ok(existing.id.clone())
+    }
+
     /// Compare-and-swap an OAuth refresh result into the latest store. Returns
     /// `false` when another process already rotated the refresh token; in that
     /// case the newer stored session is left untouched.
+    ///
+    /// On success the row changes the way [`AccountStore::commit_refresh`]
+    /// changes it, without pinning `current`: the credential is replaced and
+    /// the last error, dead-token verdict and refresh claim are cleared.
+    /// Prefer [`crate::OAuthClient::refresh_shared`], which also claims the
+    /// token before spending it.
     pub fn replace_oauth_after_refresh(
         path: &Path,
         account_id: &str,
@@ -369,6 +479,10 @@ impl AccountStore {
                 return Ok(false);
             }
             account.replace_oauth_tokens(refreshed)?;
+            account.clear_error();
+            account.dead_refresh_fingerprint = None;
+            account.refresh_lease = None;
+            account.last_refreshed_at = Some(Utc::now());
             Ok(true)
         })
     }
@@ -805,8 +919,7 @@ mod tests {
         AccountStore {
             version: 1,
             accounts: ids.iter().map(|id| account(id)).collect(),
-            current: None,
-            migrated_from: Vec::new(),
+            ..AccountStore::default()
         }
     }
 
@@ -1364,5 +1477,298 @@ mod tests {
             paths.first(),
             Some(&store_dir().join("anthropic-accounts.json"))
         );
+    }
+
+    /// A store document written by another tool: extra top-level keys, extra
+    /// row keys, extra credential keys, and every optional field this crate
+    /// models populated.
+    fn foreign_store_json(refresh: &str) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "current": "oauth",
+            "writer": { "name": "anthropic-auth", "version": "9.9.9" },
+            "accounts": [
+                {
+                    "id": "oauth",
+                    "label": "Work",
+                    "email": "me@example.com",
+                    "credential": {
+                        "type": "oauth",
+                        "access": "sk-ant-oat01-oldoldoldoldoldoldoldold",
+                        "refresh": refresh,
+                        "expires_at": 1_700_000_000_000i64,
+                        "refresh_expires_at": 1_900_000_000_000i64,
+                        "scopes": ["user:inference", "user:profile"],
+                        "account": { "uuid": "acct", "email_address": "me@example.com" },
+                        "organization": { "uuid": "org" },
+                        "subscription_type": "max"
+                    },
+                    "enabled": true,
+                    "created_at": "2026-09-01T00:00:00Z",
+                    "last_used_at": "2026-09-02T00:00:00Z",
+                    "quota": {
+                        "five_hour_percent": 12.5,
+                        "seven_day_percent": 40.0,
+                        "checked_at": "2026-09-02T00:00:00Z"
+                    },
+                    "host_sidecar": { "pi": { "lastUsed": 123 } }
+                },
+                {
+                    "id": "other",
+                    "credential": { "type": "api_key", "key": "sk-ant-api01-aaaaaaaaaaaaaaaaaaaaaa" },
+                    "enabled": true,
+                    "created_at": "2026-09-01T00:00:00Z",
+                    "refresh_lease": {
+                        "id": "lease",
+                        "until": 1_700_000_000_000i64,
+                        "token_fingerprint": "abcdef0123456789"
+                    },
+                    "dead_refresh_fingerprint": "0123456789abcdef",
+                    "notes": ["keep me"]
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn row_updates_preserve_every_field_they_do_not_own() {
+        let dir = tmp_dir("preserve-fields");
+        let path = dir.join("accounts.json");
+        let old_refresh = "sk-ant-ort01-oldoldoldoldoldoldoldold";
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&foreign_store_json(old_refresh)).unwrap(),
+        )
+        .unwrap();
+
+        // Every kind of row update this crate makes.
+        AccountStore::mutate(&path, |store| {
+            store
+                .get_mut("oauth")
+                .unwrap()
+                .mark_rate_limited(at(1_800_000_000));
+            Ok(())
+        })
+        .unwrap();
+        assert!(
+            AccountStore::commit_refresh_at(
+                &path,
+                "oauth",
+                &RefreshToken::new(old_refresh),
+                None,
+                OAuthTokens {
+                    access: AccessToken::new("sk-ant-oat01-newnewnewnewnewnewnewnew"),
+                    refresh: RefreshToken::new("sk-ant-ort01-newnewnewnewnewnewnewnew"),
+                    expires_at: at(1_800_000_000),
+                    refresh_expires_at: None,
+                    scopes: Vec::new(),
+                    account: None,
+                    organization: None,
+                },
+            )
+            .unwrap()
+        );
+        AccountStore::mutate(&path, |store| {
+            store.record_quota("other", Some(1.0), None, at(1_800_000_000));
+            Ok(())
+        })
+        .unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["writer"]["name"], "anthropic-auth");
+        let oauth = &raw["accounts"][0];
+        assert_eq!(oauth["host_sidecar"]["pi"]["lastUsed"], 123);
+        assert_eq!(oauth["credential"]["subscription_type"], "max");
+        assert_eq!(oauth["label"], "Work");
+        assert_eq!(oauth["email"], "me@example.com");
+        assert_eq!(oauth["quota"]["seven_day_percent"], 40.0);
+        assert_eq!(oauth["credential"]["account"]["uuid"], "acct");
+        assert_eq!(oauth["credential"]["organization"]["uuid"], "org");
+        assert_eq!(
+            oauth["credential"]["refresh_expires_at"],
+            1_900_000_000_000i64
+        );
+        assert_eq!(
+            oauth["credential"]["refresh"],
+            "sk-ant-ort01-newnewnewnewnewnewnewnew"
+        );
+        assert!(oauth["rate_limited_until"].is_string());
+        let other = &raw["accounts"][1];
+        assert_eq!(other["notes"][0], "keep me");
+        assert_eq!(other["dead_refresh_fingerprint"], "0123456789abcdef");
+        assert_eq!(other["refresh_lease"]["id"], "lease");
+        assert_eq!(other["quota"]["five_hour_percent"], 1.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_locked_write_clears_stale_flags_and_keeps_real_ones() {
+        let dir = tmp_dir("stale-flags");
+        let path = dir.join("accounts.json");
+        let mut store = AccountStore::default();
+        let mut stale = Account::new(
+            "stale",
+            Credential::Oauth(oauth_tokens(
+                "sk-ant-ort01-stalestalestalestale00",
+                1_900_000_000,
+            )),
+        );
+        stale.last_error = Some("invalid_grant".into());
+        let mut dead = Account::new(
+            "dead",
+            Credential::Oauth(oauth_tokens(
+                "sk-ant-ort01-deaddeaddeaddeaddead00",
+                1_900_000_000,
+            )),
+        );
+        dead.dead_refresh_fingerprint = dead.credential_fingerprint();
+        dead.record_error("invalid_grant");
+        store.upsert(stale);
+        store.upsert(dead);
+        store.save(&path).unwrap();
+
+        // Any locked write, even one about something else.
+        AccountStore::mutate(&path, |store| {
+            store.current = Some("dead".into());
+            Ok(())
+        })
+        .unwrap();
+        let reloaded = AccountStore::load(&path).unwrap();
+        assert_eq!(reloaded.get("stale").unwrap().last_error, None);
+        assert_eq!(
+            reloaded.get("dead").unwrap().current_error(),
+            Some("invalid_grant")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replace_after_refresh_clears_everything_bound_to_the_old_token() {
+        let dir = tmp_dir("replace-clears");
+        let path = dir.join("accounts.json");
+        let old = "sk-ant-ort01-oldoldoldoldoldoldoldold";
+        let mut account =
+            Account::new("oauth", Credential::Oauth(oauth_tokens(old, 1_800_000_000)));
+        account.dead_refresh_fingerprint = account.credential_fingerprint();
+        account.record_error("invalid_grant");
+        account.quota = Some(crate::account::QuotaObservation {
+            five_hour_percent: Some(3.0),
+            seven_day_percent: None,
+            checked_at: Some(at(1_700_000_000)),
+        });
+        let mut store = AccountStore::default();
+        store.upsert(account);
+        store.save(&path).unwrap();
+        assert!(
+            AccountStore::replace_oauth_after_refresh(
+                &path,
+                "oauth",
+                &RefreshToken::new(old),
+                oauth_tokens("sk-ant-ort01-newnewnewnewnewnewnewnew", 1_900_000_000),
+            )
+            .unwrap()
+        );
+        let row = AccountStore::load(&path).unwrap();
+        let row = row.get("oauth").unwrap();
+        assert_eq!(row.last_error, None);
+        assert_eq!(row.dead_refresh_fingerprint, None);
+        assert!(row.refresh_lease.is_none());
+        assert!(row.last_refreshed_at.is_some());
+        assert_eq!(row.quota.as_ref().unwrap().five_hour_percent, Some(3.0));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn merge_login_updates_the_same_login_in_place() {
+        let mut tokens = oauth_tokens("sk-ant-ort01-oldoldoldoldoldoldoldold", 1_800_000_000);
+        tokens.account = Some(TokenAccount {
+            uuid: "acct".into(),
+            email_address: Some("me@example.com".into()),
+        });
+        tokens.organization = Some(TokenOrganization { uuid: "org".into() });
+        let mut existing = Account::new("me@example.com", Credential::Oauth(tokens.clone()));
+        existing.label = Some("Work".into());
+        existing.quota = Some(crate::account::QuotaObservation {
+            five_hour_percent: Some(9.0),
+            seven_day_percent: None,
+            checked_at: Some(at(1_700_000_000)),
+        });
+        existing.dead_refresh_fingerprint = existing.credential_fingerprint();
+        existing.record_error("invalid_grant");
+        existing.enabled = false;
+        existing
+            .extra
+            .insert("host".into(), serde_json::json!({"keep": true}));
+        let mut store = AccountStore::default();
+        store.upsert(existing);
+        store.current = Some("me@example.com".into());
+
+        let mut fresh = tokens;
+        fresh.refresh = RefreshToken::new("sk-ant-ort01-freshfreshfreshfresh00");
+        let id = store
+            .merge_login(Account::new("login-id", Credential::Oauth(fresh.clone())))
+            .unwrap();
+        assert_eq!(id, "me@example.com");
+        assert_eq!(store.accounts.len(), 1);
+        let row = store.get("me@example.com").unwrap();
+        assert_eq!(row.oauth().unwrap().refresh, fresh.refresh);
+        assert!(row.enabled);
+        assert_eq!(row.last_error, None);
+        assert_eq!(row.dead_refresh_fingerprint, None);
+        assert_eq!(row.label.as_deref(), Some("Work"));
+        assert_eq!(row.quota.as_ref().unwrap().five_hour_percent, Some(9.0));
+        assert_eq!(row.extra["host"]["keep"], true);
+        assert_eq!(store.current.as_deref(), Some("me@example.com"));
+
+        // A different login is appended.
+        let other = store
+            .merge_login(Account::new(
+                "other",
+                Credential::Oauth(oauth_tokens(
+                    "sk-ant-ort01-otherotherotherother0",
+                    1_800_000_000,
+                )),
+            ))
+            .unwrap();
+        assert_eq!(other, "other");
+        assert_eq!(store.accounts.len(), 2);
+    }
+
+    #[test]
+    fn a_scanned_legacy_file_is_recorded_even_when_every_row_was_skipped() {
+        let dir = tmp_dir("legacy-scan");
+        let canonical = dir.join("canonical.json");
+        let legacy = dir.join("anthropic-accounts.json");
+        store_with(&["kept"]).save(&canonical).unwrap();
+        let mut dead = flat_legacy_json("dead", "sk-ant-ort01-dead", false);
+        dead["disabledReason"] = serde_json::json!("invalid_grant");
+        write_flat_legacy(&legacy, vec![dead]);
+
+        let loaded =
+            AccountStore::load_or_migrate_from(&canonical, std::slice::from_ref(&legacy)).unwrap();
+        let ids: Vec<&str> = loaded
+            .store
+            .accounts
+            .iter()
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            ["kept"],
+            "a row disabled with invalid_grant is never imported"
+        );
+        assert_eq!(
+            loaded.store.migrated_from,
+            vec![legacy.to_string_lossy().to_string()]
+        );
+        // Persisting it goes through a locked merge, not a snapshot overwrite.
+        assert_eq!(
+            AccountStore::merge_adopted(&canonical, &loaded.store).unwrap(),
+            0
+        );
+        let on_disk = AccountStore::load(&canonical).unwrap();
+        assert_eq!(on_disk.migrated_from, loaded.store.migrated_from);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

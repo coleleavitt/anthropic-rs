@@ -82,39 +82,49 @@ pub struct RefreshLease {
 }
 
 /// One credential the caller can route requests through.
+///
+/// Serialization goes through a private wire form that keeps every field this
+/// crate does not know about, both on the row (`extra`) and inside the
+/// credential object (`credential_extra`). The store is shared with other
+/// writers (the TypeScript plugin, older crate versions); a row update that
+/// dropped their fields would be a silent rebuild of the row, which is exactly
+/// the bug class that left stale `invalid_grant` flags and lost quota readings
+/// behind (doc 23 §1.2).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "AccountWire", into = "AccountWire")]
 pub struct Account {
     /// Stable key for this account within the store.
     pub id: String,
     /// Optional human label for pickers and logs.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     /// Account email, when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
     /// The credential itself.
     pub credential: Credential,
     /// Whether this account participates in routing.
-    #[serde(default = "default_true")]
     pub enabled: bool,
     /// When the account was added.
-    #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     /// When a request last used it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<DateTime<Utc>>,
     /// Cooldown end after a 429; the account is skipped until then.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limited_until: Option<DateTime<Utc>>,
     /// Last error recorded against this account, already secret-redacted.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Read it through [`Account::current_error`]: the raw field can be stale
+    /// (written by another tool, or about a token the row no longer holds).
     pub last_error: Option<String>,
+    /// Fingerprint of the credential `last_error` was recorded against. An
+    /// error bound to a token the row no longer holds is stale and clears
+    /// itself (see [`Account::current_error`]).
+    pub last_error_fingerprint: Option<String>,
+    /// When a refresh of this row last succeeded (this crate's own commit
+    /// path). Independent of the server echoing a refresh-token expiry.
+    pub last_refreshed_at: Option<DateTime<Utc>>,
     /// Last observed plan-window utilisation, so selection can skip an
     /// exhausted account.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota: Option<QuotaObservation>,
     /// In-flight cross-process refresh claim.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_lease: Option<RefreshLease>,
     /// Fingerprint of a refresh token Anthropic already rejected with
     /// `invalid_grant`. A revoked family never recovers, but the credential
@@ -122,8 +132,154 @@ pub struct Account {
     /// Mirrors Claude Code's in-memory `u2n` set, persisted so a restart does
     /// not start asking again; scoped to the token, not the account, so a
     /// later re-login is not stranded by its predecessor's verdict.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dead_refresh_fingerprint: Option<String>,
+    /// Credential-object fields this crate does not model, preserved verbatim.
+    pub credential_extra: serde_json::Map<String, serde_json::Value>,
+    /// Row fields this crate does not model, preserved verbatim.
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Keys of the `credential` object this crate models, per credential type.
+const OAUTH_CREDENTIAL_KEYS: [&str; 8] = [
+    "type",
+    "access",
+    "refresh",
+    "expires_at",
+    "refresh_expires_at",
+    "scopes",
+    "account",
+    "organization",
+];
+const API_KEY_CREDENTIAL_KEYS: [&str; 2] = ["type", "key"];
+
+/// Keys of the row object this crate models.
+const ACCOUNT_KEYS: [&str; 14] = [
+    "id",
+    "label",
+    "email",
+    "credential",
+    "enabled",
+    "created_at",
+    "last_used_at",
+    "rate_limited_until",
+    "last_error",
+    "last_error_fingerprint",
+    "last_refreshed_at",
+    "quota",
+    "refresh_lease",
+    "dead_refresh_fingerprint",
+];
+
+/// The on-disk row shape. Private: [`Account`] is the API.
+#[derive(Serialize, Deserialize)]
+struct AccountWire {
+    id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    email: Option<String>,
+    credential: serde_json::Map<String, serde_json::Value>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "Utc::now")]
+    created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_used_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rate_limited_until: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_error_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_refreshed_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quota: Option<QuotaObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_lease: Option<RefreshLease>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dead_refresh_fingerprint: Option<String>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn credential_keys(credential: &Credential) -> &'static [&'static str] {
+    match credential {
+        Credential::Oauth(_) => &OAUTH_CREDENTIAL_KEYS,
+        Credential::ApiKey { .. } => &API_KEY_CREDENTIAL_KEYS,
+    }
+}
+
+impl TryFrom<AccountWire> for Account {
+    type Error = serde_json::Error;
+
+    fn try_from(wire: AccountWire) -> std::result::Result<Self, Self::Error> {
+        let credential: Credential =
+            serde_json::from_value(serde_json::Value::Object(wire.credential.clone()))?;
+        let known = credential_keys(&credential);
+        let credential_extra = wire
+            .credential
+            .into_iter()
+            .filter(|(key, _)| !known.contains(&key.as_str()))
+            .collect();
+        Ok(Self {
+            id: wire.id,
+            label: wire.label,
+            email: wire.email,
+            credential,
+            enabled: wire.enabled,
+            created_at: wire.created_at,
+            last_used_at: wire.last_used_at,
+            rate_limited_until: wire.rate_limited_until,
+            last_error: wire.last_error,
+            last_error_fingerprint: wire.last_error_fingerprint,
+            last_refreshed_at: wire.last_refreshed_at,
+            quota: wire.quota,
+            refresh_lease: wire.refresh_lease,
+            dead_refresh_fingerprint: wire.dead_refresh_fingerprint,
+            credential_extra,
+            extra: wire.extra,
+        })
+    }
+}
+
+impl From<Account> for AccountWire {
+    fn from(account: Account) -> Self {
+        let known = credential_keys(&account.credential);
+        let mut credential = match serde_json::to_value(&account.credential) {
+            Ok(serde_json::Value::Object(map)) => map,
+            // `Credential` is an internally tagged enum of structs; it always
+            // serializes to an object.
+            _ => serde_json::Map::new(),
+        };
+        for (key, value) in account.credential_extra {
+            if !known.contains(&key.as_str()) && !credential.contains_key(&key) {
+                credential.insert(key, value);
+            }
+        }
+        let extra = account
+            .extra
+            .into_iter()
+            .filter(|(key, _)| !ACCOUNT_KEYS.contains(&key.as_str()))
+            .collect();
+        Self {
+            id: account.id,
+            label: account.label,
+            email: account.email,
+            credential,
+            enabled: account.enabled,
+            created_at: account.created_at,
+            last_used_at: account.last_used_at,
+            rate_limited_until: account.rate_limited_until,
+            last_error: account.last_error,
+            last_error_fingerprint: account.last_error_fingerprint,
+            last_refreshed_at: account.last_refreshed_at,
+            quota: account.quota,
+            refresh_lease: account.refresh_lease,
+            dead_refresh_fingerprint: account.dead_refresh_fingerprint,
+            extra,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -154,9 +310,13 @@ impl Account {
             last_used_at: None,
             rate_limited_until: None,
             last_error: None,
+            last_error_fingerprint: None,
+            last_refreshed_at: None,
             quota: None,
             refresh_lease: None,
             dead_refresh_fingerprint: None,
+            credential_extra: serde_json::Map::new(),
+            extra: serde_json::Map::new(),
         }
     }
 
@@ -196,7 +356,67 @@ impl Account {
     /// Record a successful use.
     pub fn mark_used(&mut self, now: DateTime<Utc>) {
         self.last_used_at = Some(now);
+        self.clear_error();
+    }
+
+    /// Fingerprint of the credential an error or verdict is bound to: the
+    /// refresh token of an OAuth row, the key of an API-key row. `None` for an
+    /// OAuth row with no refresh token.
+    pub fn credential_fingerprint(&self) -> Option<String> {
+        match &self.credential {
+            Credential::Oauth(tokens) => {
+                let refresh = tokens.refresh.expose();
+                (!refresh.is_empty()).then(|| crate::token::token_fingerprint(refresh))
+            }
+            Credential::ApiKey { key } => Some(crate::token::token_fingerprint(key.expose())),
+        }
+    }
+
+    /// Record an error against the credential the row holds right now. The
+    /// text is stored redacted and bound to the credential's fingerprint, so
+    /// it expires by itself once the token rotates.
+    pub fn record_error(&mut self, reason: impl AsRef<str>) {
+        self.last_error = Some(crate::token::redact_secrets(reason.as_ref()));
+        self.last_error_fingerprint = self.credential_fingerprint();
+    }
+
+    /// Forget the last error and its binding.
+    pub fn clear_error(&mut self) {
         self.last_error = None;
+        self.last_error_fingerprint = None;
+    }
+
+    /// The last error, when it still describes the credential the row holds.
+    ///
+    /// - A bound error (`last_error_fingerprint` set) is current only while
+    ///   the row holds the token it was recorded against.
+    /// - An unbound error (written by an older crate or another tool) that
+    ///   claims `invalid_grant` is current only while the row's refresh token
+    ///   is recorded dead. Every real `invalid_grant` verdict records the
+    ///   dead fingerprint, so an unbound one without it is a leftover
+    ///   (doc 23 §1: four live accounts carried exactly this).
+    /// - Any other unbound error is returned as-is.
+    pub fn current_error(&self) -> Option<&str> {
+        let error = self.last_error.as_deref()?;
+        match &self.last_error_fingerprint {
+            Some(bound) => {
+                (self.credential_fingerprint().as_deref() == Some(bound.as_str())).then_some(error)
+            }
+            None if error.contains("invalid_grant") => {
+                self.refresh_token_is_dead().then_some(error)
+            }
+            None => Some(error),
+        }
+    }
+
+    /// Drop `last_error` when [`Account::current_error`] says it is stale.
+    /// Returns whether anything changed.
+    pub fn clear_stale_error(&mut self) -> bool {
+        if self.last_error.is_some() && self.current_error().is_none() {
+            self.clear_error();
+            return true;
+        }
+        false
     }
 
     /// Put the account into a rate-limit cooldown ending at `until`.
@@ -212,18 +432,24 @@ impl Account {
     /// Disable the account and record why. The reason is stored redacted.
     pub fn disable(&mut self, reason: impl AsRef<str>) {
         self.enabled = false;
-        self.last_error = Some(crate::token::redact_secrets(reason.as_ref()));
+        self.record_error(reason);
     }
 
     /// Re-enable the account and clear its cooldown and last error.
     pub fn enable(&mut self) {
         self.enabled = true;
         self.rate_limited_until = None;
-        self.last_error = None;
+        self.clear_error();
     }
 
     /// Replace the stored OAuth session and synchronize derived account
     /// metadata from the token payload.
+    ///
+    /// Only the credential and the email change. When the refresh token
+    /// changes, every record bound to the old token goes with it: the last
+    /// error, a dead-token verdict for a different token, and a refresh claim
+    /// on a different token. Quota, lease-free metadata and unknown fields are
+    /// kept.
     ///
     /// A custody tombstone (`claustrum-tombstone:v1:*`) is refused: the merged
     /// anthropic-auth never mirrors a host's tombstone into the shared account
@@ -238,8 +464,27 @@ impl Account {
                 self.id
             )));
         };
+        let token_changed = current.refresh != tokens.refresh;
         *current = tokens;
-        self.email = email;
+        if email.is_some() {
+            self.email = email;
+        }
+        if token_changed {
+            let fingerprint = self.credential_fingerprint();
+            self.clear_error();
+            if self.dead_refresh_fingerprint.is_some()
+                && self.dead_refresh_fingerprint != fingerprint
+            {
+                self.dead_refresh_fingerprint = None;
+            }
+            if self
+                .refresh_lease
+                .as_ref()
+                .is_some_and(|lease| Some(&lease.token_fingerprint) != fingerprint.as_ref())
+            {
+                self.refresh_lease = None;
+            }
+        }
         Ok(())
     }
 
@@ -464,5 +709,96 @@ mod tests {
 
         let back: Account = serde_json::from_str(&stripped).unwrap();
         assert!(back.enabled, "absent `enabled` must default to true");
+    }
+
+    fn oauth_row(refresh: &str) -> Account {
+        Account::new(
+            "row",
+            Credential::Oauth(OAuthTokens {
+                access: AccessToken::new("sk-ant-oat01-aaaaaaaaaaaaaaaaaaaaaa"),
+                refresh: RefreshToken::new(refresh),
+                expires_at: at(1_700_000_000),
+                refresh_expires_at: None,
+                scopes: vec!["user:inference".into()],
+                account: None,
+                organization: None,
+            }),
+        )
+    }
+
+    #[test]
+    fn unknown_row_and_credential_fields_survive_a_round_trip() {
+        let json = serde_json::json!({
+            "id": "row",
+            "credential": {
+                "type": "oauth",
+                "access": "sk-ant-oat01-aaaaaaaaaaaaaaaaaaaaaa",
+                "refresh": "sk-ant-ort01-aaaaaaaaaaaaaaaaaaaaaa",
+                "expires_at": 1_700_000_000_000i64,
+                "subscription_type": "max",
+                "rate_limit_tier": { "tier": 20 }
+            },
+            "enabled": true,
+            "created_at": "2026-09-01T00:00:00Z",
+            "host_state": { "opencode": { "pinned": true } },
+            "future_flag": 7
+        });
+        let account: Account = serde_json::from_value(json).unwrap();
+        assert_eq!(account.extra["future_flag"], 7);
+        assert_eq!(account.credential_extra["subscription_type"], "max");
+        let back = serde_json::to_value(&account).unwrap();
+        assert_eq!(back["host_state"]["opencode"]["pinned"], true);
+        assert_eq!(back["future_flag"], 7);
+        assert_eq!(back["credential"]["subscription_type"], "max");
+        assert_eq!(back["credential"]["rate_limit_tier"]["tier"], 20);
+        assert_eq!(back["credential"]["type"], "oauth");
+        // Known keys are never duplicated into the extras.
+        assert!(!account.extra.contains_key("credential"));
+        assert!(!account.credential_extra.contains_key("refresh"));
+    }
+
+    #[test]
+    fn an_error_is_bound_to_the_token_it_was_recorded_against() {
+        let mut account = oauth_row("sk-ant-ort01-firstfirstfirstfirst00");
+        account.record_error("refresh failed: 503");
+        assert_eq!(account.current_error(), Some("refresh failed: 503"));
+        // The token rotates: the error was about the old one.
+        account
+            .replace_oauth_tokens(OAuthTokens {
+                refresh: RefreshToken::new("sk-ant-ort01-secondsecondsecond000"),
+                ..account.oauth().unwrap().clone()
+            })
+            .unwrap();
+        assert_eq!(account.current_error(), None);
+        assert_eq!(account.last_error, None);
+    }
+
+    #[test]
+    fn a_stale_unbound_invalid_grant_flag_clears_itself() {
+        // doc 23 §1: the flag another writer left on a row whose token
+        // refreshed fine afterwards, with no dead-token record.
+        let mut account = oauth_row("sk-ant-ort01-liveliveliveliveliv00");
+        account.last_error = Some("invalid_grant".into());
+        assert_eq!(account.current_error(), None);
+        assert!(account.clear_stale_error());
+        assert_eq!(account.last_error, None);
+
+        // A flag bound to a different token is stale too.
+        let mut bound_elsewhere = oauth_row("sk-ant-ort01-liveliveliveliveliv00");
+        bound_elsewhere.last_error = Some("invalid_grant".into());
+        bound_elsewhere.last_error_fingerprint = Some("0000000000000000".into());
+        assert!(bound_elsewhere.clear_stale_error());
+
+        // A real verdict on the current token stays.
+        let mut dead = oauth_row("sk-ant-ort01-deaddeaddeaddeaddead0");
+        dead.dead_refresh_fingerprint = dead.credential_fingerprint();
+        dead.last_error = Some("invalid_grant".into());
+        assert_eq!(dead.current_error(), Some("invalid_grant"));
+        assert!(!dead.clear_stale_error());
+
+        // Unbound errors that are not about the grant are left alone.
+        let mut other = oauth_row("sk-ant-ort01-otherotherotherother0");
+        other.last_error = Some("user disabled".into());
+        assert!(!other.clear_stale_error());
     }
 }

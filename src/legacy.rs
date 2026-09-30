@@ -10,7 +10,10 @@
 //!
 //! Adoption is deliberately lossy in one direction only: a row that cannot
 //! yield a usable credential is dropped rather than surfaced as a broken
-//! account.
+//! account. That includes a row a predecessor disabled with `invalid_grant`:
+//! its refresh token is dead by definition, and importing it (disabled, or
+//! live, or as a bare `last_error` flag) only re-plants the stale verdicts
+//! doc 23 traced back to these files.
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
@@ -111,30 +114,42 @@ impl LegacyAccount {
             organization,
         });
 
-        let last_error = non_empty(self.disabled_reason)
-            .or_else(|| non_empty(self.last_auth_error))
-            .map(|reason| {
-                // Legacy `lastAuthError` sometimes held a whole OAuth error
-                // body, so scrub it before it enters the shared store.
-                let mut redacted = redact_secrets(&reason);
-                redacted.truncate(MAX_STORED_ERROR_LEN);
-                redacted
-            });
+        let enabled = self.enabled.unwrap_or(true);
+        let reason = non_empty(self.disabled_reason).or_else(|| non_empty(self.last_auth_error));
+        let invalid_grant = reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("invalid_grant"));
+        if invalid_grant && !enabled {
+            return None;
+        }
+        // An enabled row whose last recorded error was `invalid_grant` was
+        // re-enabled after it (a re-login): the verdict is about an older
+        // token, so it is not carried over.
+        let last_error = reason.filter(|_| !invalid_grant).map(|reason| {
+            // Legacy `lastAuthError` sometimes held a whole OAuth error
+            // body, so scrub it before it enters the shared store.
+            let mut redacted = redact_secrets(&reason);
+            let mut end = MAX_STORED_ERROR_LEN.min(redacted.len());
+            while !redacted.is_char_boundary(end) {
+                end -= 1;
+            }
+            redacted.truncate(end);
+            redacted
+        });
 
-        Some(Account {
-            label: non_empty(self.name).or_else(|| email.clone()),
-            email,
-            credential,
-            enabled: self.enabled.unwrap_or(true),
-            created_at: timestamp_from_epoch_ms(self.added_at).unwrap_or_default(),
-            last_used_at: timestamp_from_epoch_ms(self.last_used),
-            rate_limited_until: timestamp_from_epoch_ms(self.rate_limit_reset_time),
-            last_error,
-            id,
-            quota: None,
-            refresh_lease: None,
-            dead_refresh_fingerprint: None,
-        })
+        let mut account = Account::new(id, credential);
+        account.label = non_empty(self.name).or_else(|| email.clone());
+        account.email = email;
+        account.enabled = enabled;
+        account.created_at = timestamp_from_epoch_ms(self.added_at).unwrap_or_default();
+        account.last_used_at = timestamp_from_epoch_ms(self.last_used);
+        account.rate_limited_until = timestamp_from_epoch_ms(self.rate_limit_reset_time);
+        if let Some(error) = last_error {
+            // Bound to the token it was recorded against, so it clears itself
+            // on the next rotation.
+            account.record_error(error);
+        }
+        Some(account)
     }
 }
 
@@ -207,13 +222,48 @@ mod tests {
     fn keeps_a_disabled_row_disabled_with_its_reason() {
         let mut row = flat_row();
         row["enabled"] = serde_json::json!(false);
-        row["disabledReason"] = serde_json::json!("invalid_grant");
+        row["disabledReason"] = serde_json::json!("user paused this account");
         let store: LegacyStore =
             serde_json::from_value(serde_json::json!({ "accounts": [row] })).unwrap();
 
         let accounts = store.into_accounts();
         assert!(!accounts[0].enabled);
-        assert_eq!(accounts[0].last_error.as_deref(), Some("invalid_grant"));
+        assert_eq!(
+            accounts[0].current_error(),
+            Some("user paused this account")
+        );
+    }
+
+    #[test]
+    fn never_imports_a_row_disabled_with_invalid_grant() {
+        // doc 23 §2.2: four legacy files still hold rows disabled with
+        // `invalid_grant`. Their tokens are dead by definition.
+        let mut disabled = flat_row();
+        disabled["enabled"] = serde_json::json!(false);
+        disabled["disabledReason"] = serde_json::json!("invalid_grant");
+        let mut grok_style = flat_row();
+        grok_style["uuid"] = serde_json::json!("grok-row");
+        grok_style["enabled"] = serde_json::json!(false);
+        grok_style["lastAuthError"] = serde_json::json!(
+            "HTTP 400 {\"error\":\"invalid_grant\",\"error_description\":\"Refresh token not found or invalid\"}"
+        );
+        let store: LegacyStore =
+            serde_json::from_value(serde_json::json!({ "accounts": [disabled, grok_style] }))
+                .unwrap();
+        assert!(store.into_accounts().is_empty());
+    }
+
+    #[test]
+    fn an_enabled_row_never_carries_an_invalid_grant_flag_over() {
+        let mut row = flat_row();
+        row["lastAuthError"] = serde_json::json!("invalid_grant");
+        let store: LegacyStore =
+            serde_json::from_value(serde_json::json!({ "accounts": [row] })).unwrap();
+        let accounts = store.into_accounts();
+        assert_eq!(accounts.len(), 1);
+        assert!(accounts[0].enabled);
+        assert_eq!(accounts[0].last_error, None);
+        assert_eq!(accounts[0].dead_refresh_fingerprint, None);
     }
 
     #[test]

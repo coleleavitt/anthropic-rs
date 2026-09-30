@@ -141,8 +141,30 @@ impl AccountStore {
             return false;
         }
         account.dead_refresh_fingerprint = Some(token_fingerprint(refresh_token.expose()));
-        account.last_error = Some("invalid_grant".into());
+        // Bound to the dead token: a later rotation or re-login clears it.
+        account.record_error("invalid_grant");
         account.refresh_lease = None;
+        true
+    }
+
+    /// Record a refresh failure that is *not* a dead-token verdict (a
+    /// transport error, a 5xx, a timeout) against the token that was
+    /// presented. Only the token the account still holds is annotated, and the
+    /// note is bound to it, so it expires with the next rotation. Never marks
+    /// the token dead. Returns whether anything changed.
+    pub fn record_refresh_error(
+        &mut self,
+        account_id: &str,
+        refresh_token: &RefreshToken,
+        message: &str,
+    ) -> bool {
+        let Some(account) = self.accounts.iter_mut().find(|a| a.id == account_id) else {
+            return false;
+        };
+        if account.oauth().map(|t| &t.refresh) != Some(refresh_token) {
+            return false;
+        }
+        account.record_error(message);
         true
     }
 
@@ -180,15 +202,53 @@ impl AccountStore {
     /// Commit a refresh result: compare-and-swap on the refresh token that was
     /// presented (`expected_refresh`), optionally fenced on `lease_id`, then
     /// install `refreshed`, clear the dead-token record, last error and
-    /// lease, and pin the account as `current`. Returns `false` (leaving the
-    /// newer stored session untouched) when another process already rotated
-    /// the token or the lease was taken over.
+    /// lease, stamp `last_refreshed_at`, and pin the account as `current`.
+    /// Returns `false` (leaving the newer stored session untouched) when
+    /// another process already rotated the token or the lease was taken over.
+    ///
+    /// This in-memory form does not check the lease's expiry; the path-level
+    /// [`AccountStore::commit_refresh_at`] does, through
+    /// [`AccountStore::commit_refresh_before_expiry`].
     pub fn commit_refresh(
         &mut self,
         account_id: &str,
         expected_refresh: &RefreshToken,
         lease_id: Option<&str>,
         refreshed: OAuthTokens,
+    ) -> bool {
+        self.commit_refresh_inner(
+            account_id,
+            expected_refresh,
+            lease_id,
+            refreshed,
+            Utc::now(),
+            false,
+        )
+    }
+
+    /// [`AccountStore::commit_refresh`] that also refuses when the lease
+    /// `lease_id` names has already expired at `now`. Once a claim lapses,
+    /// another process may take it and present the same token; a result
+    /// obtained under a lapsed claim is never committed.
+    pub fn commit_refresh_before_expiry(
+        &mut self,
+        account_id: &str,
+        expected_refresh: &RefreshToken,
+        lease_id: Option<&str>,
+        refreshed: OAuthTokens,
+        now: DateTime<Utc>,
+    ) -> bool {
+        self.commit_refresh_inner(account_id, expected_refresh, lease_id, refreshed, now, true)
+    }
+
+    fn commit_refresh_inner(
+        &mut self,
+        account_id: &str,
+        expected_refresh: &RefreshToken,
+        lease_id: Option<&str>,
+        refreshed: OAuthTokens,
+        now: DateTime<Utc>,
+        enforce_lease_expiry: bool,
     ) -> bool {
         let Some(account) = self.accounts.iter_mut().find(|a| a.id == account_id) else {
             return false;
@@ -199,10 +259,13 @@ impl AccountStore {
         if &current.refresh != expected_refresh {
             return false;
         }
-        if let Some(lease_id) = lease_id
-            && account.refresh_lease.as_ref().map(|l| l.id.as_str()) != Some(lease_id)
-        {
-            return false;
+        if let Some(lease_id) = lease_id {
+            let Some(lease) = account.refresh_lease.as_ref() else {
+                return false;
+            };
+            if lease.id != lease_id || (enforce_lease_expiry && lease.until <= now) {
+                return false;
+            }
         }
         let mut next = refreshed;
         let Some(current) = oauth_mut(account) else {
@@ -224,13 +287,15 @@ impl AccountStore {
             return false;
         }
         account.dead_refresh_fingerprint = None;
-        account.last_error = None;
+        account.clear_error();
         account.refresh_lease = None;
+        account.last_refreshed_at = Some(now);
         self.current = Some(account_id.to_owned());
         true
     }
 
-    /// [`AccountStore::commit_refresh`] under the store lock.
+    /// [`AccountStore::commit_refresh_before_expiry`] under the store lock,
+    /// judged against the wall clock at commit time.
     pub fn commit_refresh_at(
         path: &Path,
         account_id: &str,
@@ -239,7 +304,13 @@ impl AccountStore {
         refreshed: OAuthTokens,
     ) -> Result<bool> {
         Self::mutate(path, |store| {
-            Ok(store.commit_refresh(account_id, expected_refresh, lease_id, refreshed))
+            Ok(store.commit_refresh_before_expiry(
+                account_id,
+                expected_refresh,
+                lease_id,
+                refreshed,
+                Utc::now(),
+            ))
         })
     }
 
@@ -397,7 +468,7 @@ mod tests {
                 .map(|id| oauth_account(id, &format!("sk-ant-ort01-{id}-refresh-aaaaaaaaaaaaaa")))
                 .collect(),
             current: None,
-            migrated_from: Vec::new(),
+            ..AccountStore::default()
         }
     }
 
@@ -576,6 +647,56 @@ mod tests {
             s.claim_refresh("a", &rotated.refresh, at(0), Duration::seconds(30), None),
             RefreshClaim::Claimed { .. }
         ));
+    }
+
+    #[test]
+    fn a_result_obtained_under_a_lapsed_claim_is_never_committed() {
+        let mut s = store(&["a"]);
+        let old = refresh_of(&s, "a");
+        let RefreshClaim::Claimed { lease_id } =
+            s.claim_refresh("a", &old, at(0), Duration::seconds(30), None)
+        else {
+            panic!()
+        };
+        let rotated = tokens(
+            "sk-ant-ort01-rotated-refresh-aaaaaaaaaaaaaa",
+            "sk-ant-oat01-rotated-access-aaaaaaaaaaaaaa",
+        );
+        // The claim lapsed at +30 s: another process may already hold it.
+        assert!(!s.commit_refresh_before_expiry(
+            "a",
+            &old,
+            Some(&lease_id),
+            rotated.clone(),
+            at(30)
+        ));
+        assert_eq!(refresh_of(&s, "a"), old);
+        assert!(s.commit_refresh_before_expiry("a", &old, Some(&lease_id), rotated, at(29)));
+        assert_eq!(s.get("a").unwrap().last_refreshed_at, Some(at(29)));
+    }
+
+    #[test]
+    fn the_dead_verdict_error_is_bound_to_the_dead_token() {
+        let mut s = store(&["a"]);
+        let dead = refresh_of(&s, "a");
+        assert!(s.mark_refresh_token_dead("a", &dead));
+        let row = s.get("a").unwrap();
+        assert_eq!(row.current_error(), Some("invalid_grant"));
+        assert_eq!(
+            row.last_error_fingerprint.as_deref(),
+            Some(token_fingerprint(dead.expose()).as_str())
+        );
+        // A transient failure is recorded against the token, never as dead.
+        let mut t = store(&["b"]);
+        let live = refresh_of(&t, "b");
+        assert!(t.record_refresh_error("b", &live, "http transport error"));
+        assert!(!t.get("b").unwrap().refresh_token_is_dead());
+        assert_eq!(
+            t.get("b").unwrap().current_error(),
+            Some("http transport error")
+        );
+        let other = RefreshToken::new("sk-ant-ort01-not-this-one-aaaaaaaaaaaaa");
+        assert!(!t.record_refresh_error("b", &other, "x"));
     }
 
     #[test]
