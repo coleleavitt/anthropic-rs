@@ -98,3 +98,18 @@ Source of truth: anthropic-auth merge `f74d736` (`sync/upstream-2026-09-26`), `p
 | Tombstones never mirrored | `Account::replace_oauth_tokens` refuses `claustrum-tombstone:v1:*`. | `replacing_oauth_tokens_keeps_account_email_in_sync` |
 
 Not applicable here: the account-lineage handoff (the Rust store keys accounts by a stable id and never had the fork's refresh-fingerprint handoff); the pre-send primary quota probe and scoped custody (no main/fallback split, no Claustrum client); bootstrap `/api/claude_cli/bootstrap` lookups. Excluded by decision: the refusal / content-filter / surrogate / session-heat / context-sanitizer layer, OpenCode/Pi host glue, and the Claustrum custody client.
+
+## Store hardening (doc 23, `store-hardening`)
+
+Source: ckl `docs/replacement/23-oauth-store-invalid-grant.md` §6–§7. Here the Rust crate deliberately *diverges* from the current TS core (`shared-account-adapter.ts`, `accounts.ts`) where the TS behavior produced stale `invalid_grant` flags and double spends; the napi binding is how the TS plugin adopts the Rust behavior.
+
+| Behavior | Rust | Tests |
+|---|---|---|
+| Row updates keep unknown fields (TS `fallbackAccountToShared` rebuilt rows and dropped `quota`, fingerprint, lease) | `Account` wire form with `extra` / `credential_extra`; `AccountStore::extra` | `row_updates_preserve_every_field_they_do_not_own`, `unknown_row_and_credential_fields_survive_a_round_trip` |
+| `last_error` bound to a token; stale flags self-clear | `last_error_fingerprint`, `Account::current_error`, `clear_stale_error` in every `mutate` | `a_stale_unbound_invalid_grant_flag_clears_itself`, `a_locked_write_clears_stale_flags_and_keeps_real_ones` |
+| Dead only on HTTP 400 `error=invalid_grant` for the token the row still holds (TS matched `message.includes`) | `Error::is_invalid_grant`, `RevocationOrigin` | `only_a_400_invalid_grant_marks_the_token_dead`, `invalid_grant_on_a_token_the_store_no_longer_holds_marks_nothing` |
+| Spend only the store's token; fail closed on unknown tokens (TS claim failed open) | `refresh_shared` `Located`, `allow_unshared` | `a_stale_caller_token_is_never_spent_the_stores_token_is`, `unknown_token_adopts_a_live_rotated_shared_credential` |
+| Token call bounded inside the claim | `OAUTH_HTTP_TIMEOUT`, `refresh_deadline`, `commit_refresh_before_expiry` | `the_default_client_gives_up_before_the_refresh_claim_lapses`, `a_stalled_token_call_is_cut_off_inside_the_claim_and_never_committed` |
+| Legacy `invalid_grant` rows not imported | `legacy.rs` | `never_imports_a_row_disabled_with_invalid_grant` |
+| One keep-alive per machine replaces the TS background refresher | `keepalive` | `two_concurrent_passes_do_the_work_once` |
+| Coarse host API | `access::get_access_token`, `anthropic-napi` | `access::tests::*`, `anthropic-napi/test/smoke.test.ts` |

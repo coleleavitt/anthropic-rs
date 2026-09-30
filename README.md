@@ -57,6 +57,29 @@ Store safety properties, each covered by a test:
 - **Secrets never land in plaintext logs** — `Debug` is redacted on every token
   newtype, and `Account::disable(reason)` runs the reason through
   `redact_secrets` before storing it.
+- **Row updates never rebuild rows** — fields this crate does not model (on
+  the document, on a row, inside a `credential`) are kept verbatim through
+  every locked update, so another writer's data survives.
+- **Only the store's refresh token is spent** — `OAuthClient::refresh_shared`
+  reads the store under its lock, claims the row, and never POSTs a token the
+  store does not hold (a stale caller token adopts or refreshes the store's
+  newer one). The token call is bounded below the 30 s claim; a result that
+  outlives its claim is discarded.
+- **Dead only on a real `invalid_grant`** — HTTP 400 with `error ==
+  "invalid_grant"`, and only for the token the row still holds.
+  `Error::RefreshTokenRevoked { origin }` says whether the endpoint answered
+  or a local record short-circuited. `last_error` is bound to the token it
+  was recorded against (`Account::current_error()`), so a stale flag clears
+  itself on the next locked write.
+- **Legacy rows disabled with `invalid_grant` are never imported.**
+- **One keep-alive per machine** — `keepalive::keep_alive_once(path, now)`
+  refreshes only idle accounts whose refresh token nears expiry (default 7
+  days) or that have no access token, behind a store-level lease. Nothing else
+  rotates idle accounts.
+
+`access::get_access_token` is the coarse entry point for hosts: selection
+(pin first, allowlist, quota reserve), refresh, adoption and rotation past a
+failing login, returning an access token and non-secret metadata only.
 
 ## Account rotation
 
@@ -105,6 +128,41 @@ Refresh responses preserve refresh-token expiry, scopes, account, and organizati
 - `DeviceIdentityStore` persists one 32-byte global ID in `device.json`; trusted-device tokens and Cowork PKCS#8 keys use `SecretStore`, never account JSON.
 - Remote Control attestation normalizes every native status and fails malformed enforced policy closed. Cowork uses P-256 SPKI registration and exact P1363 create-session binding.
 - `sign_request_body` implements the independently verified 2.1.233 CCH seed `0x4d659218e32a3268` with the 2.1.172+ global model/max-token preimage transform, including nested fields.
+
+## Node / Bun binding (`anthropic-napi`)
+
+The workspace member `anthropic-napi` exposes the store to JavaScript hosts
+(the anthropic-auth TypeScript plugin) through Node-API, so they stop keeping
+their own token custody. The API is coarse and asynchronous
+(`anthropic-napi/index.d.ts`): `listAccounts`, `getAccessToken({ account,
+allowlist, reservePct })`, `markRateLimited`, `recordQuota`,
+`recordQuotaHeaders`, `markUsed`, `setAccountEnabled`, `removeAccount`,
+`reorderAccounts`, `setCurrent`, `keepAliveOnce`, `startLogin` /
+`completeLogin` (PKCE; the verifier and the code exchange stay in Rust),
+`importOAuthAccount` (one-way migration into the store) and
+`handleUnauthorized` (one claimed refresh after a 401). **Refresh tokens never
+cross into JavaScript.** Errors are `AnthropicAuthError` with `code` one of
+`auth_required`, `quota_reserve`, `invalid_grant`, `config`, `transient`.
+
+Build (plain cargo, no `@napi-rs/cli` needed; the loader looks for
+`anthropic-napi.<platform>-<arch>.node` next to `index.js`, or
+`$ANTHROPIC_NAPI_PATH`):
+
+```sh
+cd anthropic-napi
+node scripts/build.mjs          # cargo build --release -p anthropic-napi, then
+                                # copies target/release/libanthropic_napi.so to
+                                # anthropic-napi.linux-x64.node (honours CARGO_TARGET_DIR)
+bun test test/                  # smoke test: temp store + mock token/messages servers
+```
+
+```js
+const { AnthropicAuth } = require('@coleleavitt/anthropic-napi')
+const auth = new AnthropicAuth() // or { storePath, tokenUrl } for tests
+const { accessToken, accountId } = await auth.getAccessToken({ reservePct: 90 })
+```
+
+The binding requires Rust 1.88+ (napi 3); the core crate stays at 1.85.
 
 ## Non-goals
 

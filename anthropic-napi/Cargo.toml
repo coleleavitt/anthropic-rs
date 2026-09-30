@@ -1,0 +1,36 @@
+[package]
+name = "anthropic-napi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Node/Bun binding over the anthropic shared account store: access tokens, quota, keep-alive and login, with refresh tokens kept in Rust"
+repository = "https://github.com/coleleavitt/anthropic-rs"
+
+[lib]
+crate-type = ["cdylib"]
+# A cdylib whose N-API symbols are resolved by the host process at load time
+# cannot link a Rust test harness. It is tested from JavaScript
+# (test/smoke.test.ts); the logic it wraps is tested in the `anthropic` crate.
+test = false
+doctest = false
+
+[dependencies]
+anthropic = { path = "..", default-features = false, features = ["store", "client"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+napi = { version = "3", default-features = false, features = ["napi8", "async"] }
+napi-derive = "3"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "sync"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+napi-build = "2"
+
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -9,6 +9,9 @@ keywords = ["anthropic", "claude", "oauth", "pkce", "llm"]
 categories = ["api-bindings", "authentication"]
 repository = "https://github.com/coleleavitt/anthropic-rs"
 
+[workspace]
+members = ["anthropic-napi"]
+
 [features]
 # Auth domain types + PKCE + endpoints only. No I/O, no network, no filesystem.
 default = ["store", "client"]
