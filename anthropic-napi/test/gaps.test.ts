@@ -484,6 +484,10 @@ describe('login: per-login redirect/state, non-persisting exchange, identity', (
       AnthropicAuthError,
     )
     expect(exchanges.length).toBe(1)
+    // Input that is not a callback is refused before any exchange.
+    const third = a.startLogin({ mode: 'console' })
+    await expectCode(a.exchangeCode({ loginId: third.loginId, callback: 'not a callback' }), 'auth_required')
+    expect(exchanges.length).toBe(1)
   })
 
   test('an anonymous grant is named from the profile endpoint', async () => {

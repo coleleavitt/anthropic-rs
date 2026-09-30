@@ -829,6 +829,45 @@ mod tests {
         assert!(matches!(err, Error::MalformedTokenResponse(_)));
     }
 
+    /// A first exchange (no prior session) must carry a well-formed refresh
+    /// token: an empty or missing one is refused, never stored.
+    #[test]
+    fn a_first_exchange_without_a_usable_refresh_token_is_refused() {
+        for refresh in [Some(String::new()), Some("r".to_owned()), None] {
+            let resp = TokenResponse {
+                access_token: VALID_ACCESS.into(),
+                refresh_token: refresh.clone(),
+                expires_in: 3600,
+                refresh_token_expires_in: None,
+                scope: None,
+                token_type: None,
+                account: None,
+                organization: None,
+            };
+            assert!(
+                matches!(
+                    resp.into_tokens(now(), None),
+                    Err(Error::MalformedTokenResponse("refresh_token"))
+                ),
+                "{refresh:?}"
+            );
+        }
+        let bad_access = TokenResponse {
+            access_token: "a".into(),
+            refresh_token: Some(VALID_REFRESH.into()),
+            expires_in: 3600,
+            refresh_token_expires_in: None,
+            scope: None,
+            token_type: None,
+            account: None,
+            organization: None,
+        };
+        assert!(matches!(
+            bad_access.into_tokens(now(), None),
+            Err(Error::MalformedTokenResponse("access_token"))
+        ));
+    }
+
     #[test]
     fn into_tokens_rejects_non_positive_lifetime() {
         let resp = TokenResponse {
