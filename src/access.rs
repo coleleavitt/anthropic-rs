@@ -142,6 +142,7 @@ impl AccessError {
             | Error::Serde(_)
             | Error::WouldDeleteAllAccounts
             | Error::CustodyTombstone { .. }
+            | Error::Config(_)
             | Error::Url(_) => AccessErrorKind::Config,
             other if other.is_invalid_grant() => AccessErrorKind::InvalidGrant,
             _ => AccessErrorKind::Transient,
@@ -393,6 +394,11 @@ pub async fn get_access_token(
             ),
         ));
     }
+    // A configuration refusal (OAuth test mode and a non-loopback token URL)
+    // will not heal with time: report it as `config`, not `transient`.
+    if let Some(config) = errors.iter().find(|e| matches!(e, Error::Config(_))) {
+        return Err(AccessError::from_error(config));
+    }
     let transient = errors
         .iter()
         .find(|e| classify_refresh_failure(e) != RefreshFailure::Revoked)
@@ -512,6 +518,32 @@ mod tests {
         .save(&path)
         .unwrap();
         path
+    }
+
+    /// Unit tests run in OAuth test mode: an expired seed against the
+    /// production token URL is a `config` failure, the token is not spent,
+    /// and the row is left as it was.
+    #[tokio::test]
+    async fn test_mode_refuses_a_production_refresh_as_config() {
+        let path = store_at("testmode", vec![row("a", Duration::hours(-1))]);
+        let error = get_access_token(
+            &OAuthClient::new(Endpoints::prod()),
+            &path,
+            &AccessRequest::default(),
+            &SharedRefreshOptions::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, AccessErrorKind::Config, "{error}");
+        let stored = AccountStore::load_or_migrate_from(&path, &[])
+            .unwrap()
+            .store;
+        let a = stored.get("a").unwrap();
+        assert_eq!(
+            a.oauth().unwrap().refresh.expose(),
+            "sk-ant-ort01-a-aaaaaaaaaaaaaaaaaa"
+        );
+        assert!(!a.refresh_token_is_dead());
     }
 
     #[tokio::test]

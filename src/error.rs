@@ -116,6 +116,11 @@ pub enum Error {
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
 
+    /// The configuration forbids the operation: e.g. OAuth test mode refused
+    /// a non-loopback OAuth host. Nothing was sent.
+    #[error("configuration error: {0}")]
+    Config(String),
+
     /// A protocol value or transition was invalid.
     #[error("anthropic protocol error: {0}")]
     Protocol(String),
@@ -256,6 +261,7 @@ impl Error {
             | Error::Protocol(_)
             | Error::Callback(_)
             | Error::Crypto(_)
+            | Error::Config(_)
             | Error::CustodyTombstone { .. } => true,
             Error::NoUsableAccount(_)
             | Error::RefreshRefused(_)

@@ -121,6 +121,32 @@ mismatch rather than proceeding. With `interactive-oauth`, `LoopbackLogin` binds
 
 Refresh responses preserve refresh-token expiry, scopes, account, and organization metadata when omitted; known-expired refresh tokens fail locally. `OAuthClient::revoke` implements the native token-family revocation body without deleting local state implicitly.
 
+### Endpoint overrides and test mode
+
+`Endpoints::from_env()` is the single place endpoints are read from the
+environment; the napi binding builds from it too. Each variable replaces one
+production URL when set and non-empty:
+
+| Variable | Replaces |
+|---|---|
+| `ANTHROPIC_OAUTH_TOKEN_URL` | token endpoint (code exchange and refresh) |
+| `ANTHROPIC_OAUTH_REVOKE_URL` | refresh-token revocation |
+| `ANTHROPIC_OAUTH_AUTHORIZE_URL` | Claude.ai authorize URL |
+| `ANTHROPIC_OAUTH_CONSOLE_AUTHORIZE_URL` | Console authorize URL (`Endpoints::console_from_env`) |
+| `ANTHROPIC_OAUTH_REDIRECT_URI` | manual redirect URI |
+| `ANTHROPIC_OAUTH_USAGE_URL` | OAuth usage endpoint |
+| `CLAUDE_CODE_OAUTH_CLIENT_ID` | client id |
+| `ANTHROPIC_BASE_URL` | Messages API base |
+
+**Test mode.** With `ANTHROPIC_OAUTH_TEST_MODE=1` (and always in this crate's
+own unit tests), every OAuth HTTP call (token, revoke, usage, profile,
+federation exchange) to a host that is not loopback fails with
+`Error::Config` before a byte is sent (`endpoints::ensure_oauth_url_allowed`).
+Any test that seeds an account which might refresh must set test mode and
+point `ANTHROPIC_OAUTH_TOKEN_URL` at its mock or a dead loopback such as
+`http://127.0.0.1:9/v1/oauth/token`, so a forgotten override can never present
+a fixture refresh token to production.
+
 ## Federation, native storage, and devices
 
 - `FederationEnvironment` implements Anthropic WIF precedence, projected assertion rereads, 16 KiB bounds, and a single-flight 120s/30s cache.
@@ -153,7 +179,9 @@ cd anthropic-napi
 node scripts/build.mjs          # cargo build --release -p anthropic-napi, then
                                 # copies target/release/libanthropic_napi.so to
                                 # anthropic-napi.linux-x64.node (honours CARGO_TARGET_DIR)
-bun test test/                  # smoke test: temp store + mock token/messages servers
+bun test test/                  # smoke test: temp store + mock token/messages servers;
+                                # test/preload.ts (bunfig.toml) sets test mode and a dead
+                                # loopback token URL before the addon loads
 ```
 
 ```js

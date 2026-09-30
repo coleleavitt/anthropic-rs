@@ -124,6 +124,10 @@ pub async fn fetch_oauth_account_identity_from(
     url: &str,
     access_token: &str,
 ) -> OAuthAccountIdentity {
+    // Test mode: a non-loopback profile host is never contacted.
+    if crate::endpoints::ensure_oauth_url_allowed(url).is_err() {
+        return OAuthAccountIdentity::default();
+    }
     let Ok(response) = http
         .get(url)
         .header("authorization", format!("Bearer {access_token}"))

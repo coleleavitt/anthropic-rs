@@ -414,6 +414,7 @@ impl FederationClient {
             "{}/v1/oauth/token",
             self.config.base_url.trim_end_matches('/')
         );
+        crate::endpoints::ensure_oauth_url_allowed(&url)?;
         let response = self
             .http
             .post(url)

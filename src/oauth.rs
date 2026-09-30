@@ -342,6 +342,7 @@ pub fn default_oauth_http_client() -> reqwest::Client {
 pub struct OAuthClient {
     http: reqwest::Client,
     endpoints: Endpoints,
+    require_loopback: bool,
 }
 
 #[cfg(feature = "client")]
@@ -352,6 +353,7 @@ impl OAuthClient {
         Self {
             http: default_oauth_http_client(),
             endpoints,
+            require_loopback: false,
         }
     }
 
@@ -361,7 +363,32 @@ impl OAuthClient {
     /// ([`OAuthClient::refresh_shared`]) bounds its own token POST inside the
     /// claim regardless.
     pub fn with_http(http: reqwest::Client, endpoints: Endpoints) -> Self {
-        Self { http, endpoints }
+        Self {
+            http,
+            endpoints,
+            require_loopback: false,
+        }
+    }
+
+    /// Force OAuth test mode for this client regardless of
+    /// [`OAUTH_TEST_MODE_ENV`](endpoints::OAUTH_TEST_MODE_ENV): every OAuth call
+    /// to a non-loopback host fails with [`Error::Config`] before a byte is
+    /// sent. For hosts whose test-mode flag does not live in the process
+    /// environment (a JS runtime's `process.env`, a config file). `false`
+    /// leaves the environment in charge; it never turns test mode off.
+    pub fn require_loopback(mut self, require: bool) -> Self {
+        self.require_loopback = require;
+        self
+    }
+
+    /// Whether this client is in OAuth test mode (forced, or from the
+    /// environment).
+    pub fn is_test_mode(&self) -> bool {
+        self.require_loopback || endpoints::oauth_test_mode()
+    }
+
+    fn ensure_allowed(&self, url: &str) -> Result<()> {
+        endpoints::check_oauth_url(url, self.is_test_mode())
     }
 
     /// The endpoint set this client targets.
@@ -516,6 +543,7 @@ impl OAuthClient {
 
     /// Revoke a refresh token without modifying local credential state.
     pub async fn revoke(&self, refresh: &RefreshToken) -> Result<RevokeOutcome> {
+        self.ensure_allowed(&self.endpoints.revoke_url)?;
         let response = self
             .http
             .post(&self.endpoints.revoke_url)
@@ -553,6 +581,7 @@ impl OAuthClient {
 
     /// Fetch Claude.ai OAuth usage data.
     pub async fn usage(&self, access: &AccessToken) -> Result<serde_json::Value> {
+        self.ensure_allowed(&self.endpoints.usage_url)?;
         let resp = self
             .http
             .get(&self.endpoints.usage_url)
@@ -583,6 +612,7 @@ impl OAuthClient {
         body: TokenRequest,
         prior: Option<&OAuthTokens>,
     ) -> Result<OAuthTokens> {
+        self.ensure_allowed(&self.endpoints.token_url)?;
         let resp = self
             .http
             .post(&self.endpoints.token_url)
@@ -924,6 +954,75 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, Error::RefreshTokenExpired));
         assert!(error.is_permanent());
+    }
+
+    /// Test mode (always on in this crate's unit tests): a non-loopback OAuth
+    /// host is refused with `Error::Config` before a connection is opened.
+    /// `0.0.0.0` reaches a local listener on Linux but is not loopback, so the
+    /// listener proves no byte left the client.
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn test_mode_refuses_non_loopback_oauth_hosts_before_connecting() {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((_socket, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let mut endpoints = Endpoints::prod();
+        endpoints.token_url = format!("http://0.0.0.0:{port}/v1/oauth/token");
+        endpoints.revoke_url = format!("http://0.0.0.0:{port}/v1/oauth/token/revoke");
+        endpoints.usage_url = format!("http://0.0.0.0:{port}/api/oauth/usage");
+        let mut prior = prior_tokens();
+        prior.expires_at = Utc::now() - Duration::seconds(5);
+        prior.refresh_expires_at = Some(Utc::now() + Duration::days(30));
+        for client in [
+            OAuthClient::new(endpoints.clone()),
+            OAuthClient::new(Endpoints::prod()),
+        ] {
+            let error = client.refresh(&prior).await.unwrap_err();
+            assert!(matches!(error, Error::Config(_)), "{error}");
+            assert!(error.is_permanent());
+            assert!(!error.to_string().contains(VALID_REFRESH));
+            let error = client
+                .exchange_code("code", &PkceVerifier::new("v".repeat(43)), "state")
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::Config(_)), "{error}");
+            let error = client.revoke(&prior.refresh).await.unwrap_err();
+            assert!(matches!(error, Error::Config(_)), "{error}");
+            let error = client.usage(&prior.access).await.unwrap_err();
+            assert!(matches!(error, Error::Config(_)), "{error}");
+            let error = client
+                .prepare_credential(&crate::token::Credential::Oauth(prior.clone()))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, Error::Config(_)), "{error}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn require_loopback_forces_test_mode_and_never_clears_it() {
+        let client = OAuthClient::new(Endpoints::prod());
+        // Unit tests always run in test mode (cfg(test)).
+        assert!(client.is_test_mode());
+        assert!(client.clone().require_loopback(false).is_test_mode());
+        let forced = client.require_loopback(true);
+        assert!(forced.is_test_mode());
+        assert!(matches!(
+            forced.ensure_allowed(endpoints::TOKEN_URL),
+            Err(Error::Config(_))
+        ));
+        forced
+            .ensure_allowed("http://127.0.0.1:9/v1/oauth/token")
+            .unwrap();
     }
 
     // Port of auth-guards.test.ts: refresh refuses empty/whitespace and
