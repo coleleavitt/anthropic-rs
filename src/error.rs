@@ -44,11 +44,17 @@ pub enum Error {
     #[error("oauth refresh token has expired; re-authentication is required")]
     RefreshTokenExpired,
 
-    /// Anthropic already rejected this refresh token with `invalid_grant`
-    /// (the token family is revoked). It is never presented again; the user
-    /// must re-authenticate.
-    #[error("oauth refresh token was revoked by anthropic; re-authentication is required")]
-    RefreshTokenRevoked,
+    /// Anthropic rejected this refresh token with `invalid_grant` (the token
+    /// family is revoked). It is never presented again; the user must
+    /// re-authenticate. `origin` says whether the endpoint said so just now
+    /// or a local record of an earlier verdict short-circuited the call.
+    #[error(
+        "oauth refresh token was revoked by anthropic ({origin}); re-authentication is required"
+    )]
+    RefreshTokenRevoked {
+        /// Where the verdict came from.
+        origin: RevocationOrigin,
+    },
 
     /// The shared refresh declined to spend the refresh token because it
     /// could not establish exclusive, well-founded ownership of it (claim
@@ -157,6 +163,39 @@ pub enum Error {
     },
 }
 
+/// Where an [`Error::RefreshTokenRevoked`] verdict came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RevocationOrigin {
+    /// The token endpoint answered just now (HTTP 400, `invalid_grant`).
+    Endpoint {
+        /// HTTP status of the answer.
+        status: u16,
+        /// The parsed OAuth `error` code.
+        error_code: Option<String>,
+    },
+    /// This process already saw the endpoint reject the token; nothing was
+    /// sent.
+    LocalDeadSet,
+    /// The store's dead-token record (`dead_refresh_fingerprint`) matched the
+    /// token at claim time; nothing was sent.
+    DeadTokenClaim,
+}
+
+impl std::fmt::Display for RevocationOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Endpoint { status, error_code } => write!(
+                f,
+                "token endpoint answered HTTP {status} {}",
+                error_code.as_deref().unwrap_or("without an error code")
+            ),
+            Self::LocalDeadSet => f.write_str("already rejected earlier in this process"),
+            Self::DeadTokenClaim => f.write_str("the shared store records this token as dead"),
+        }
+    }
+}
+
 #[cfg(feature = "client")]
 pub(crate) async fn redacted_response_body(
     mut response: reqwest::Response,
@@ -207,7 +246,7 @@ impl Error {
             Error::StateMismatch
             | Error::ExpiredNoRefresh
             | Error::RefreshTokenExpired
-            | Error::RefreshTokenRevoked
+            | Error::RefreshTokenRevoked { .. }
             | Error::MalformedTokenResponse(_)
             | Error::InvalidRedirect
             | Error::WouldDeleteAllAccounts
@@ -241,6 +280,34 @@ impl Error {
         }
     }
 
+    /// Where a [`Error::RefreshTokenRevoked`] verdict came from; `None` for
+    /// every other error.
+    pub fn revocation_origin(&self) -> Option<&RevocationOrigin> {
+        match self {
+            Error::RefreshTokenRevoked { origin } => Some(origin),
+            _ => None,
+        }
+    }
+
+    /// The revocation this endpoint error amounts to, when it is a real
+    /// `invalid_grant` (see [`Error::is_invalid_grant`]).
+    pub fn into_revocation(self) -> std::result::Result<Error, Error> {
+        match self {
+            Error::Endpoint {
+                status: 400,
+                error_code: Some(code),
+                ..
+            } if code == "invalid_grant" => Ok(Error::RefreshTokenRevoked {
+                origin: RevocationOrigin::Endpoint {
+                    status: 400,
+                    error_code: Some(code),
+                },
+            }),
+            revoked @ Error::RefreshTokenRevoked { .. } => Ok(revoked),
+            other => Err(other),
+        }
+    }
+
     /// Whether this failure means the account hit a rate limit and should be
     /// rotated away from rather than disabled.
     pub fn is_rate_limited(&self) -> bool {
@@ -255,7 +322,7 @@ impl Error {
     /// dead, and a false positive strands a working login.
     pub fn is_invalid_grant(&self) -> bool {
         match self {
-            Error::RefreshTokenRevoked => true,
+            Error::RefreshTokenRevoked { .. } => true,
             Error::Endpoint {
                 status: 400,
                 error_code,
@@ -283,7 +350,27 @@ mod tests {
     #[test]
     fn only_a_400_with_the_invalid_grant_code_is_invalid_grant() {
         assert!(endpoint(400, Some("invalid_grant"), "").is_invalid_grant());
-        assert!(Error::RefreshTokenRevoked.is_invalid_grant());
+        assert!(
+            Error::RefreshTokenRevoked {
+                origin: RevocationOrigin::LocalDeadSet
+            }
+            .is_invalid_grant()
+        );
+        let revoked = endpoint(400, Some("invalid_grant"), "")
+            .into_revocation()
+            .unwrap();
+        assert_eq!(
+            revoked.revocation_origin(),
+            Some(&RevocationOrigin::Endpoint {
+                status: 400,
+                error_code: Some("invalid_grant".into())
+            })
+        );
+        assert!(
+            endpoint(401, Some("invalid_grant"), "")
+                .into_revocation()
+                .is_err()
+        );
         // The body merely mentioning it is not the verdict.
         assert!(!endpoint(400, None, "upstream said invalid_grant somewhere").is_invalid_grant());
         assert!(!endpoint(400, Some("invalid_client"), "invalid_grant").is_invalid_grant());

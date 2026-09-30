@@ -43,7 +43,7 @@ use std::sync::{Mutex, OnceLock};
 
 use chrono::{Duration, Utc};
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, RevocationOrigin};
 use crate::oauth::OAuthClient;
 use crate::refresh_claim::{REFRESH_LEASE_TTL_SECS, RefreshClaim};
 use crate::store::AccountStore;
@@ -170,7 +170,7 @@ pub enum RefreshFailure {
 pub fn classify_refresh_failure(error: &Error) -> RefreshFailure {
     match error {
         Error::RefreshRefused(_) => RefreshFailure::Refused,
-        Error::RefreshTokenRevoked | Error::RefreshTokenExpired => RefreshFailure::Revoked,
+        Error::RefreshTokenRevoked { .. } | Error::RefreshTokenExpired => RefreshFailure::Revoked,
         other if other.is_invalid_grant() => RefreshFailure::Revoked,
         _ => RefreshFailure::Error,
     }
@@ -303,7 +303,9 @@ impl OAuthClient {
                 // Explicitly unshared: only the process-local dead guard can
                 // protect it.
                 if DeadRefreshTokens::is_dead(presented.refresh.expose()) {
-                    return Err(Error::RefreshTokenRevoked);
+                    return Err(Error::RefreshTokenRevoked {
+                        origin: RevocationOrigin::LocalDeadSet,
+                    });
                 }
                 let refreshed = match tokio::time::timeout(
                     refresh_deadline(options.lease_ttl_secs),
@@ -344,7 +346,11 @@ impl OAuthClient {
                         account_id: Some(account_id),
                     });
                 }
-                RefreshClaim::DeadToken => return Err(Error::RefreshTokenRevoked),
+                RefreshClaim::DeadToken => {
+                    return Err(Error::RefreshTokenRevoked {
+                        origin: RevocationOrigin::DeadTokenClaim,
+                    });
+                }
                 RefreshClaim::UnknownAccount => {
                     return Err(Error::RefreshRefused(
                         "refresh claim account disappeared".into(),
@@ -384,7 +390,9 @@ impl OAuthClient {
         options: &SharedRefreshOptions,
     ) -> Result<SharedRefreshOutcome> {
         if DeadRefreshTokens::is_dead(spend.refresh.expose()) {
-            return Err(Error::RefreshTokenRevoked);
+            return Err(Error::RefreshTokenRevoked {
+                origin: RevocationOrigin::LocalDeadSet,
+            });
         }
         // Bounded inside the claim even when the caller supplied its own HTTP
         // client (`with_http`) without a timeout.
@@ -400,7 +408,7 @@ impl OAuthClient {
                 // Marks only when the store still holds exactly this token:
                 // a peer's newer rotation never inherits the verdict.
                 let _ = AccountStore::mark_refresh_token_dead_at(path, account_id, &spend.refresh);
-                return Err(Error::RefreshTokenRevoked);
+                return Err(error.into_revocation().unwrap_or_else(|other| other));
             }
             Ok(Err(error)) => {
                 let _ = AccountStore::mutate(path, |store| {
@@ -569,11 +577,13 @@ impl OAuthClient {
 }
 
 fn remember_if_revoked(error: Error, presented: &OAuthTokens) -> Error {
-    if error.is_invalid_grant() {
-        DeadRefreshTokens::remember(presented.refresh.expose());
-        return Error::RefreshTokenRevoked;
+    match error.into_revocation() {
+        Ok(revoked) => {
+            DeadRefreshTokens::remember(presented.refresh.expose());
+            revoked
+        }
+        Err(other) => other,
     }
-    error
 }
 
 #[cfg(test)]
@@ -781,7 +791,10 @@ mod tests {
             .unwrap();
         assert!(!recovery.decision.retry);
         assert!(recovery.outcome.is_none());
-        assert!(matches!(recovery.failure, Some(Error::RefreshTokenRevoked)));
+        assert!(matches!(
+            recovery.failure,
+            Some(Error::RefreshTokenRevoked { .. })
+        ));
     }
 
     #[test]
@@ -840,7 +853,18 @@ mod tests {
             .refresh_shared(&path, &presented, &SharedRefreshOptions::default())
             .await
             .unwrap_err();
-        assert!(matches!(error, Error::RefreshTokenRevoked), "{error}");
+        assert!(
+            matches!(error, Error::RefreshTokenRevoked { .. }),
+            "{error}"
+        );
+        // The verdict says it came from the endpoint, not a local record.
+        assert_eq!(
+            error.revocation_origin(),
+            Some(&RevocationOrigin::Endpoint {
+                status: 400,
+                error_code: Some("invalid_grant".into())
+            })
+        );
         assert_eq!(classify_refresh_failure(&error), RefreshFailure::Revoked);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         let row = AccountStore::load(&path).unwrap();
@@ -852,7 +876,10 @@ mod tests {
                 .refresh_shared(&path, &presented, &SharedRefreshOptions::default())
                 .await
                 .unwrap_err();
-            assert!(matches!(error, Error::RefreshTokenRevoked));
+            assert_eq!(
+                error.revocation_origin(),
+                Some(&RevocationOrigin::DeadTokenClaim)
+            );
         }
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         // A credential the store has never seen is guarded process-locally.
@@ -871,13 +898,16 @@ mod tests {
             .refresh_shared(&path2, &unknown, &unshared)
             .await
             .unwrap_err();
-        assert!(matches!(first, Error::RefreshTokenRevoked));
+        assert!(matches!(first, Error::RefreshTokenRevoked { .. }));
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         let second = client(&url)
             .refresh_shared(&path2, &unknown, &unshared)
             .await
             .unwrap_err();
-        assert!(matches!(second, Error::RefreshTokenRevoked));
+        assert_eq!(
+            second.revocation_origin(),
+            Some(&RevocationOrigin::LocalDeadSet)
+        );
         assert_eq!(
             hits.load(Ordering::SeqCst),
             2,
@@ -1160,7 +1190,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                !matches!(error, Error::RefreshTokenRevoked),
+                !matches!(error, Error::RefreshTokenRevoked { .. }),
                 "{status} {body}"
             );
             assert_eq!(
@@ -1178,7 +1208,7 @@ mod tests {
                 .refresh_shared(&path, &presented, &SharedRefreshOptions::default())
                 .await
                 .unwrap_err();
-            assert!(!matches!(again, Error::RefreshTokenRevoked));
+            assert!(!matches!(again, Error::RefreshTokenRevoked { .. }));
             assert_eq!(hits.load(Ordering::SeqCst), 2);
             std::fs::remove_dir_all(path.parent().unwrap()).ok();
         }
@@ -1221,7 +1251,7 @@ mod tests {
             .refresh_shared(&path, &presented, &SharedRefreshOptions::default())
             .await
             .unwrap_err();
-        assert!(matches!(error, Error::RefreshTokenRevoked));
+        assert!(matches!(error, Error::RefreshTokenRevoked { .. }));
         let stored = AccountStore::load(&path).unwrap();
         let row = stored.get("shared").unwrap();
         assert_eq!(
@@ -1290,7 +1320,12 @@ mod tests {
             body: String::new(),
         };
         assert!(invalid.is_invalid_grant());
-        assert!(Error::RefreshTokenRevoked.is_permanent());
+        assert!(
+            Error::RefreshTokenRevoked {
+                origin: RevocationOrigin::LocalDeadSet
+            }
+            .is_permanent()
+        );
         DeadRefreshTokens::remember("sk-ant-ort01-zzzzzzzzzzzzzzzzzzzzzzz");
         assert!(DeadRefreshTokens::is_dead(
             "sk-ant-ort01-zzzzzzzzzzzzzzzzzzzzzzz"

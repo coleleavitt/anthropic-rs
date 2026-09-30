@@ -150,7 +150,7 @@ pub use device::{
     trusted_device_token_from_env,
 };
 pub use endpoints::{Endpoints, Scope};
-pub use error::{Error, Result};
+pub use error::{Error, Result, RevocationOrigin};
 #[cfg(feature = "federation")]
 pub use federation::{
     FederatedToken,
@@ -202,7 +202,14 @@ pub use retry::{CredentialReceipt, RetryAfter401, decide_retry_after_401};
 pub use sticky_routing::StickySessionRouter;
 pub use sticky_routing::{RoutingMode, StickyRouteFamily};
 #[cfg(feature = "store")]
-pub use store::{AccountStore, LoadSource, Loaded, default_store_path, store_dir};
+pub use store::{
+    AccountStore,
+    LoadSource,
+    Loaded,
+    account_identities,
+    default_store_path,
+    store_dir,
+};
 pub use token::{
     AccessToken,
     ApiKey,

@@ -84,7 +84,7 @@ fn default_version() -> u32 {
 /// account UUID and the store id stay put. Matching on any key keeps a merge
 /// from admitting the same login twice — which would put duplicate ids in the
 /// store and make every id-keyed update ambiguous.
-fn account_identities(account: &Account) -> Vec<String> {
+pub fn account_identities(account: &Account) -> Vec<String> {
     let mut keys = vec![format!("id:{}", account.id)];
     match &account.credential {
         Credential::ApiKey { key } => keys.push(format!("api_key:{}", key.expose())),
@@ -388,16 +388,22 @@ impl AccountStore {
     }
 
     /// Persist accounts adopted from legacy stores (see
-    /// [`Self::load_or_migrate_from`]) without overwriting anything: under the
-    /// lock, each row is appended only when none of its identities is already
-    /// present, and the scanned legacy paths are recorded. Returns how many
-    /// rows were added.
-    pub fn merge_adopted(path: &Path, loaded: &Self) -> Result<usize> {
+    /// [`Self::load_or_migrate_from`]) without overwriting anything. Under the
+    /// store lock, the file is re-read and each of `rows` is appended only
+    /// when none of its [`account_identities`] is already present; existing
+    /// rows, their fields (known and unknown) and the pin are untouched.
+    /// `migrated_from` paths not yet recorded are added. Returns how many rows
+    /// were appended.
+    ///
+    /// This is the locked replacement for persisting a
+    /// [`Self::load_or_migrate`] result with [`Self::save`], which overwrites
+    /// every rotation made since the load.
+    pub fn merge_adopted(path: &Path, rows: &[Account], migrated_from: &[String]) -> Result<usize> {
         Self::mutate(path, |store| {
             let mut seen: HashSet<String> =
                 store.accounts.iter().flat_map(account_identities).collect();
             let mut added = 0;
-            for account in &loaded.accounts {
+            for account in rows {
                 let identities = account_identities(account);
                 if identities.iter().any(|key| seen.contains(key)) {
                     continue;
@@ -406,7 +412,7 @@ impl AccountStore {
                 store.accounts.push(account.clone());
                 added += 1;
             }
-            for path in &loaded.migrated_from {
+            for path in migrated_from {
                 if !store.migrated_from.contains(path) {
                     store.migrated_from.push(path.clone());
                 }
@@ -1768,11 +1774,65 @@ mod tests {
         );
         // Persisting it goes through a locked merge, not a snapshot overwrite.
         assert_eq!(
-            AccountStore::merge_adopted(&canonical, &loaded.store).unwrap(),
+            AccountStore::merge_adopted(
+                &canonical,
+                &loaded.store.accounts,
+                &loaded.store.migrated_from
+            )
+            .unwrap(),
             0
         );
         let on_disk = AccountStore::load(&canonical).unwrap();
         assert_eq!(on_disk.migrated_from, loaded.store.migrated_from);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn merge_adopted_appends_only_new_logins_and_keeps_rotations_made_since_the_load() {
+        let dir = tmp_dir("merge-adopted");
+        let path = dir.join("accounts.json");
+        let mut on_disk = AccountStore::default();
+        on_disk.upsert(Account::new(
+            "a",
+            Credential::Oauth(oauth_tokens(
+                "sk-ant-ort01-aaaaaaaaaaaaaaaaaaaaaaaaa",
+                1_900_000_000,
+            )),
+        ));
+        on_disk.save(&path).unwrap();
+        // A snapshot taken now, plus one adopted row.
+        let mut snapshot = AccountStore::load(&path).unwrap();
+        snapshot.accounts.push(Account::new(
+            "b",
+            Credential::Oauth(oauth_tokens(
+                "sk-ant-ort01-bbbbbbbbbbbbbbbbbbbbbbbbb",
+                1_900_000_000,
+            )),
+        ));
+        // Meanwhile a peer rotates `a` and adds a field this crate ignores.
+        AccountStore::mutate(&path, |store| {
+            let row = store.get_mut("a")?;
+            row.replace_oauth_tokens(oauth_tokens(
+                "sk-ant-ort01-rotatedrotatedrotatedrot",
+                1_900_000_000,
+            ))?;
+            row.extra.insert("peer".into(), serde_json::json!(1));
+            Ok(())
+        })
+        .unwrap();
+        let added = AccountStore::merge_adopted(&path, &snapshot.accounts, &["/legacy".to_owned()])
+            .unwrap();
+        assert_eq!(added, 1);
+        let merged = AccountStore::load(&path).unwrap();
+        let a = merged.get("a").unwrap();
+        assert_eq!(
+            a.oauth().unwrap().refresh.expose(),
+            "sk-ant-ort01-rotatedrotatedrotatedrot",
+            "the peer's rotation survives"
+        );
+        assert_eq!(a.extra["peer"], 1);
+        assert!(merged.get("b").is_some());
+        assert_eq!(merged.migrated_from, vec!["/legacy".to_owned()]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
