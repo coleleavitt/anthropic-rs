@@ -343,6 +343,8 @@ pub struct OAuthClient {
     http: reqwest::Client,
     endpoints: Endpoints,
     require_loopback: bool,
+    #[cfg(feature = "store")]
+    native_publish: crate::credentials::NativePublish,
 }
 
 #[cfg(feature = "client")]
@@ -354,6 +356,8 @@ impl OAuthClient {
             http: default_oauth_http_client(),
             endpoints,
             require_loopback: false,
+            #[cfg(feature = "store")]
+            native_publish: crate::credentials::NativePublish::from_env(),
         }
     }
 
@@ -367,6 +371,8 @@ impl OAuthClient {
             http,
             endpoints,
             require_loopback: false,
+            #[cfg(feature = "store")]
+            native_publish: crate::credentials::NativePublish::from_env(),
         }
     }
 
@@ -379,6 +385,24 @@ impl OAuthClient {
     pub fn require_loopback(mut self, require: bool) -> Self {
         self.require_loopback = require;
         self
+    }
+
+    /// Whether (and where) a rotation this client commits through
+    /// [`OAuthClient::refresh_shared`] is published to Claude Code's
+    /// credential file (only ever when that file still holds the spent
+    /// token). Default: [`NativePublish::from_env`](crate::credentials::NativePublish::from_env),
+    /// i.e. `Auto` unless `ANTHROPIC_NATIVE_PUBLISH=0`; `Auto` is suppressed
+    /// in OAuth test mode.
+    #[cfg(feature = "store")]
+    pub fn native_publish(mut self, policy: crate::credentials::NativePublish) -> Self {
+        self.native_publish = policy;
+        self
+    }
+
+    /// The native-publish policy (see [`OAuthClient::native_publish`]).
+    #[cfg(feature = "store")]
+    pub fn native_publish_policy(&self) -> &crate::credentials::NativePublish {
+        &self.native_publish
     }
 
     /// Whether this client is in OAuth test mode (forced, or from the

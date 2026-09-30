@@ -30,8 +30,10 @@
 //!   1 s; Claude Code 2.1.285 `secureStorage` write path). Claude Code's own
 //!   read-modify-write of the file happens under the same lock.
 //!
-//! [`NativePublish`] is the policy knob shared by every consumer (this crate's
-//! [`crate::refresh::SharedRefreshOptions`], ckl, the napi binding).
+//! [`NativePublish`] is the policy knob shared by every consumer: it is set
+//! on the OAuth client (`OAuthClient::native_publish`, used by
+//! `OAuthClient::refresh_shared`), so ckl, the napi binding and any other
+//! Rust caller behave the same way.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

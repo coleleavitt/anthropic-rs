@@ -82,7 +82,7 @@ Store safety properties, each covered by a test:
   `.credentials.json` when (and only when) that file still holds the spent
   refresh token: never created, never through a symlink, never over an
   unparseable file, unknown keys kept, `0600` + rename, under Claude Code's
-  own `.storage-write.lock`. `SharedRefreshOptions::native_publish`
+  own `.storage-write.lock`. `OAuthClient::native_publish`
   (`NativePublish::{Off, Auto, At(path)}`); default `Auto` unless
   `ANTHROPIC_NATIVE_PUBLISH=0`; `Auto` is suppressed in OAuth test mode.
 - **Revoke is claimed** — `OAuthClient::revoke_account` claims the row,

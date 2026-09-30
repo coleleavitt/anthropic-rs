@@ -610,15 +610,12 @@ pub struct AnthropicAuth {
 }
 
 impl AnthropicAuth {
+    /// The OAuth client every refresh goes through: this handle's endpoints,
+    /// test mode and native-publish policy.
     fn client(&self) -> OAuthClient {
-        OAuthClient::new(self.endpoints.clone()).require_loopback(self.test_mode)
-    }
-
-    fn refresh_options(&self) -> SharedRefreshOptions {
-        SharedRefreshOptions {
-            native_publish: self.native_publish.clone(),
-            ..SharedRefreshOptions::default()
-        }
+        OAuthClient::new(self.endpoints.clone())
+            .require_loopback(self.test_mode)
+            .native_publish(self.native_publish.clone())
     }
 
     /// Fold the configured legacy stores into the store (append-only,
@@ -873,7 +870,7 @@ impl AnthropicAuth {
             &self.client(),
             &self.path,
             &request,
-            &self.refresh_options(),
+            &SharedRefreshOptions::default(),
         )
         .await
         .map(access_token_of)
@@ -1054,10 +1051,7 @@ impl AnthropicAuth {
         options: Option<KeepAliveOnceOptions>,
     ) -> napi::Result<KeepAliveResult> {
         let options = options.unwrap_or_default();
-        let mut keepalive = KeepAliveOptions {
-            refresh: self.refresh_options(),
-            ..KeepAliveOptions::default()
-        };
+        let mut keepalive = KeepAliveOptions::default();
         if let Some(days) = options.threshold_days {
             if !(days.is_finite() && days > 0.0) {
                 return Err(config("thresholdDays must be a positive number"));
@@ -1323,7 +1317,7 @@ impl AnthropicAuth {
                 &self.path,
                 &options.account_id,
                 disposition,
-                &self.refresh_options(),
+                &SharedRefreshOptions::default(),
             )
             .await
             .map_err(|e| from_crate(&e))?;
@@ -1478,7 +1472,11 @@ impl AnthropicAuth {
     ) -> napi::Result<UnauthorizedResult> {
         let recovery = self
             .client()
-            .recover_unauthorized(&self.path, &options.access_token, &self.refresh_options())
+            .recover_unauthorized(
+                &self.path,
+                &options.access_token,
+                &SharedRefreshOptions::default(),
+            )
             .await
             .map_err(|e| from_crate(&e))?;
         let path = self.path.clone();
