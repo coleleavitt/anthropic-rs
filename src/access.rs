@@ -708,11 +708,16 @@ mod tests {
     #[tokio::test]
     async fn a_dead_login_rotates_to_the_next_and_all_dead_is_invalid_grant() {
         let (url, hits) = token_server(400, INVALID_GRANT).await;
+        // Own ids (and so own refresh tokens): the dead set this test fills
+        // is process-wide, and other tests here refresh `row("a")`.
         let path = store_at(
             "dead",
-            vec![row("a", Duration::hours(-1)), row("b", Duration::hours(2))],
+            vec![
+                row("dead-a", Duration::hours(-1)),
+                row("dead-b", Duration::hours(2)),
+            ],
         );
-        // `a` is expired and dead; `b` is live: `b` serves.
+        // `dead-a` is expired and dead; `dead-b` is live: `dead-b` serves.
         let grant = get_access_token(
             &client(&url),
             &path,
@@ -721,14 +726,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(grant.account_id, "b");
+        assert_eq!(grant.account_id, "dead-b");
         assert_eq!(hits.load(Ordering::SeqCst), 0);
-        // Only `a` allowed: its refresh is rejected -> invalid_grant.
+        // Only `dead-a` allowed: its refresh is rejected -> invalid_grant.
         let error = get_access_token(
             &client(&url),
             &path,
             &AccessRequest {
-                account: Some("a@example.com".into()),
+                account: Some("dead-a@example.com".into()),
                 ..AccessRequest::default()
             },
             &SharedRefreshOptions::default(),
@@ -742,7 +747,7 @@ mod tests {
             &client(&url),
             &path,
             &AccessRequest {
-                allowlist: vec!["a".into()],
+                allowlist: vec!["dead-a".into()],
                 ..AccessRequest::default()
             },
             &SharedRefreshOptions::default(),
