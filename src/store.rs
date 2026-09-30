@@ -63,6 +63,10 @@ pub struct AccountStore {
     /// adoption is recorded rather than repeated.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub migrated_from: Vec<String>,
+    /// The machine-wide keep-alive lease: at most one process runs
+    /// [`crate::keepalive`] at a time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive: Option<crate::keepalive::KeepAliveLease>,
     /// Top-level fields this crate does not model, preserved verbatim so a
     /// write never drops another writer's data.
     #[serde(flatten)]

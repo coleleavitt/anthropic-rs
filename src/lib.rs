@@ -19,7 +19,8 @@
 //!    signals ([`stream_signals`]), the model catalog ([`model_catalog`]) and
 //!    profile identity ([`profile`]). With `store`: refresh leases and
 //!    dead-token records ([`refresh_claim`]), pool selection ([`routing`]),
-//!    and — with `client` — the fail-closed shared refresh ([`refresh`]).
+//!    and — with `client` — the fail-closed shared refresh ([`refresh`]) and
+//!    the single-owner idle-account keep-alive ([`keepalive`]).
 //!
 //! # Auth-only consumers
 //!
@@ -66,6 +67,8 @@ pub mod error;
 pub mod federation;
 #[cfg(feature = "store")]
 mod file_security;
+#[cfg(feature = "store")]
+pub mod keepalive;
 #[cfg(feature = "store")]
 mod legacy;
 pub mod messages;
@@ -156,6 +159,10 @@ pub use federation::{
     FederationEnvironment,
     IdentityTokenSource,
 };
+#[cfg(feature = "store")]
+pub use keepalive::{KeepAliveLease, KeepAliveOptions, keepalive_due};
+#[cfg(all(feature = "client", feature = "store"))]
+pub use keepalive::{KeepAliveReport, keep_alive_once};
 pub use killswitch::{KillswitchConfig, KillswitchThresholds};
 #[cfg(feature = "client")]
 pub use messages::MessagesClient;
