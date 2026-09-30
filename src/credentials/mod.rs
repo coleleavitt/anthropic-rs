@@ -3,6 +3,7 @@
 mod file;
 #[cfg(feature = "secure-store")]
 mod keyring;
+mod publish;
 
 use std::path::{Path, PathBuf};
 
@@ -10,6 +11,17 @@ use chrono::{TimeZone, Utc};
 pub use file::FileSecretStore;
 #[cfg(feature = "secure-store")]
 pub use keyring::KeyringSecretStore;
+pub use publish::{
+    NATIVE_PUBLISH_ENV,
+    NATIVE_WRITE_LOCK_NAME,
+    NATIVE_WRITE_LOCK_STALE,
+    NativeOAuthSummary,
+    NativePublish,
+    NativePublishOutcome,
+    native_publish_enabled_value,
+    publish_native_rotation,
+    read_native_claude_summary,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
@@ -151,28 +163,38 @@ struct NativeOauth {
     client_id: Option<String>,
 }
 
-/// Resolve Claude Code's plaintext fallback credential path.
+/// Resolve Claude Code's plaintext fallback credential path:
+/// `$CLAUDE_SECURESTORAGE_CONFIG_DIR` (empty means the default), else
+/// `$CLAUDE_CONFIG_DIR`, else `$HOME/.claude`, each joined with
+/// `.credentials.json`.
 pub fn native_claude_credentials_path() -> PathBuf {
-    if let Some(directory) = std::env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR") {
+    native_claude_credentials_path_from_lookup(|key| std::env::var(key).ok())
+}
+
+/// [`native_claude_credentials_path`] over an arbitrary variable lookup (a JS
+/// host's environment snapshot, tests).
+pub fn native_claude_credentials_path_from_lookup(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> PathBuf {
+    let default_directory = || {
+        let home = lookup("HOME")
+            .filter(|v| !v.is_empty())
+            .or_else(|| lookup("USERPROFILE").filter(|v| !v.is_empty()))
+            .unwrap_or_else(|| ".".into());
+        PathBuf::from(home).join(".claude")
+    };
+    if let Some(directory) = lookup("CLAUDE_SECURESTORAGE_CONFIG_DIR") {
         let directory = if directory.is_empty() {
-            default_claude_directory()
+            default_directory()
         } else {
             PathBuf::from(directory)
         };
         return directory.join(".credentials.json");
     }
-    if let Some(directory) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty())
-    {
+    if let Some(directory) = lookup("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()) {
         return PathBuf::from(directory).join(".credentials.json");
     }
-    default_claude_directory().join(".credentials.json")
-}
-
-fn default_claude_directory() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .unwrap_or_else(|| ".".into());
-    PathBuf::from(home).join(".claude")
+    default_directory().join(".credentials.json")
 }
 
 /// Native Claude's secure-storage account name. Unsafe characters fall back to

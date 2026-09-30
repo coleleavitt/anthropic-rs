@@ -36,6 +36,12 @@
 //!    and the still-live claim; a result obtained under a lapsed claim is
 //!    discarded. A lost race adopts the winner's session when it is usable
 //!    and refuses otherwise. The lease is released on every path.
+//! 7. After a rotation this call performed, Claude Code's credential file is
+//!    brought forward when it still holds the spent token
+//!    ([`SharedRefreshOptions::native_publish`],
+//!    [`crate::credentials::publish_native_rotation`]). The rotation is
+//!    already committed; a failed publish never fails the refresh and is
+//!    reported on [`SharedRefreshOutcome::native_publish`].
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -43,6 +49,7 @@ use std::sync::{Mutex, OnceLock};
 
 use chrono::{Duration, Utc};
 
+use crate::credentials::{NativePublish, NativePublishOutcome};
 use crate::error::{Error, Result, RevocationOrigin};
 use crate::oauth::OAuthClient;
 use crate::refresh_claim::{REFRESH_LEASE_TTL_SECS, RefreshClaim};
@@ -76,10 +83,14 @@ pub struct SharedRefreshOutcome {
     pub source: RefreshSource,
     /// The store account it belongs to, when known.
     pub account_id: Option<String>,
+    /// What publishing the rotation to Claude Code's credential file did.
+    /// `None` when this call did not rotate the token itself, or the
+    /// publish is off or suppressed by OAuth test mode.
+    pub native_publish: Option<NativePublishOutcome>,
 }
 
 /// Tunables for [`OAuthClient::refresh_shared`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SharedRefreshOptions {
     /// Claim attempts before refusing (each waits a jittered 1–2 s).
     pub claim_max_attempts: u32,
@@ -94,6 +105,12 @@ pub struct SharedRefreshOptions {
     /// token may be one a peer just rotated, and spending it revokes the
     /// family. Only the process-local dead set guards it.
     pub allow_unshared: bool,
+    /// Publish a rotation this call performed to Claude Code's credential
+    /// file when that file still holds the spent refresh token. Default:
+    /// [`NativePublish::from_env`] (on unless
+    /// [`crate::credentials::NATIVE_PUBLISH_ENV`] turns it off);
+    /// [`NativePublish::Auto`] is suppressed in OAuth test mode.
+    pub native_publish: NativePublish,
 }
 
 impl Default for SharedRefreshOptions {
@@ -103,6 +120,7 @@ impl Default for SharedRefreshOptions {
             claim_wait_ms: 1_000,
             lease_ttl_secs: REFRESH_LEASE_TTL_SECS,
             allow_unshared: false,
+            native_publish: NativePublish::from_env(),
         }
     }
 }
@@ -276,6 +294,7 @@ impl OAuthClient {
                     tokens,
                     source: RefreshSource::AdoptedPeer,
                     account_id: Some(account_id),
+                    native_publish: None,
                 });
             }
             // The caller's token is stale and the store's session has expired
@@ -290,6 +309,7 @@ impl OAuthClient {
                     tokens,
                     source: RefreshSource::AdoptedShared,
                     account_id,
+                    native_publish: None,
                 });
             }
             Located::Unknown => {
@@ -316,10 +336,14 @@ impl OAuthClient {
                     Ok(result) => result.map_err(|error| remember_if_revoked(error, presented))?,
                     Err(_) => return Err(Error::Timeout("oauth token refresh".into())),
                 };
+                let native_publish = self
+                    .publish_native(&options.native_publish, &presented.refresh, &refreshed)
+                    .await;
                 return Ok(SharedRefreshOutcome {
                     tokens: refreshed,
                     source: RefreshSource::Refreshed,
                     account_id: None,
+                    native_publish,
                 });
             }
         };
@@ -344,6 +368,7 @@ impl OAuthClient {
                         tokens,
                         source: RefreshSource::AdoptedPeer,
                         account_id: Some(account_id),
+                        native_publish: None,
                     });
                 }
                 RefreshClaim::DeadToken => {
@@ -423,10 +448,14 @@ impl OAuthClient {
             refreshed.clone(),
         )?;
         if committed {
+            let native_publish = self
+                .publish_native(&options.native_publish, &spend.refresh, &refreshed)
+                .await;
             return Ok(SharedRefreshOutcome {
                 tokens: refreshed,
                 source: RefreshSource::Refreshed,
                 account_id: Some(account_id.to_owned()),
+                native_publish,
             });
         }
         let winner = AccountStore::load_or_migrate_from(path, &[])
@@ -454,6 +483,29 @@ impl OAuthClient {
             tokens: winner,
             source: RefreshSource::AdoptedWinner,
             account_id: Some(account_id.to_owned()),
+            native_publish: None,
+        })
+    }
+
+    /// Bring Claude Code's credential file forward after a rotation this
+    /// process committed (module docs, step 7). Blocking file work (Claude
+    /// Code's write lock may be waited on for a few seconds) runs off the
+    /// async worker.
+    async fn publish_native(
+        &self,
+        policy: &NativePublish,
+        spent: &crate::token::RefreshToken,
+        rotated: &OAuthTokens,
+    ) -> Option<NativePublishOutcome> {
+        let path = policy.target(self.is_test_mode())?;
+        let spent = spent.clone();
+        let rotated = rotated.clone();
+        let work = move || crate::credentials::publish_native_rotation(&path, &spent, &rotated);
+        Some(match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle.spawn_blocking(work).await.unwrap_or_else(|e| {
+                NativePublishOutcome::Failed(format!("publish worker failed: {e}"))
+            }),
+            Err(_) => work(),
         })
     }
 }
@@ -824,6 +876,137 @@ mod tests {
         assert_eq!(again.tokens.refresh.expose(), NEW_REFRESH);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// Claude Code's credential file beside the test store, holding
+    /// `refresh` (0600, the shape Claude Code writes).
+    fn native_beside(path: &Path, refresh: &str) -> std::path::PathBuf {
+        let native = path.parent().unwrap().join(".credentials.json");
+        let doc = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-nativenativenativenative",
+                "refreshToken": refresh,
+                "expiresAt": 1_700_000_000_000_i64,
+                "scopes": ["user:inference"],
+                "subscriptionType": "max"
+            },
+            "mcpOAuth": { "keep": true }
+        });
+        std::fs::write(&native, serde_json::to_vec(&doc).unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&native, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        native
+    }
+
+    fn publishing_to(native: &Path) -> SharedRefreshOptions {
+        SharedRefreshOptions {
+            native_publish: NativePublish::At(native.to_path_buf()),
+            ..SharedRefreshOptions::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rotation_is_published_to_claude_code_when_it_held_the_spent_token() {
+        let (url, hits) = token_server(200, ROTATED_BODY).await;
+        const TAG: &str = "native-publish";
+        let path = store_path(TAG);
+        let presented = old_tokens(TAG);
+        seeded_store(&path, &presented);
+        let native = native_beside(&path, presented.refresh.expose());
+        let outcome = client(&url)
+            .refresh_shared(&path, &presented, &publishing_to(&native))
+            .await
+            .unwrap();
+        assert_eq!(outcome.source, RefreshSource::Refreshed);
+        assert_eq!(outcome.native_publish, Some(NativePublishOutcome::Written));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&native).unwrap()).unwrap();
+        assert_eq!(doc["claudeAiOauth"]["refreshToken"], NEW_REFRESH);
+        assert_eq!(doc["claudeAiOauth"]["accessToken"], NEW_ACCESS);
+        assert_eq!(doc["claudeAiOauth"]["subscriptionType"], "max");
+        assert_eq!(doc["mcpOAuth"]["keep"], true);
+        // The store and Claude Code now agree; the next pass adopts, spends
+        // nothing and publishes nothing.
+        let again = client(&url)
+            .refresh_shared(&path, &presented, &publishing_to(&native))
+            .await
+            .unwrap();
+        assert_eq!(again.source, RefreshSource::AdoptedShared);
+        assert_eq!(again.native_publish, None);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_native_file_holding_another_token_is_never_rewritten() {
+        let (url, _hits) = token_server(200, ROTATED_BODY).await;
+        const TAG: &str = "native-foreign";
+        let path = store_path(TAG);
+        let presented = old_tokens(TAG);
+        seeded_store(&path, &presented);
+        let native = native_beside(&path, "sk-ant-ort01-claudecoderotatedonitsown00");
+        let before = std::fs::read(&native).unwrap();
+        let outcome = client(&url)
+            .refresh_shared(&path, &presented, &publishing_to(&native))
+            .await
+            .unwrap();
+        assert_eq!(outcome.native_publish, Some(NativePublishOutcome::NotHeld));
+        assert_eq!(std::fs::read(&native).unwrap(), before);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_publishes_nothing() {
+        let (url, _hits) = token_server(400, INVALID_GRANT_BODY).await;
+        const TAG: &str = "native-dead";
+        let path = store_path(TAG);
+        let presented = old_tokens(TAG);
+        seeded_store(&path, &presented);
+        let native = native_beside(&path, presented.refresh.expose());
+        let before = std::fs::read(&native).unwrap();
+        let error = client(&url)
+            .refresh_shared(&path, &presented, &publishing_to(&native))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::RefreshTokenRevoked { .. }),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&native).unwrap(), before);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn the_publish_is_off_by_policy_and_auto_is_suppressed_in_test_mode() {
+        for (tag, policy) in [
+            ("native-off", NativePublish::Off),
+            // `cfg(test)` is OAuth test mode: `Auto` never resolves (or
+            // reads) the real `~/.claude/.credentials.json`.
+            ("native-auto", NativePublish::Auto),
+        ] {
+            let (url, _hits) = token_server(200, ROTATED_BODY).await;
+            let path = store_path(tag);
+            let presented = old_tokens(tag);
+            seeded_store(&path, &presented);
+            let native = native_beside(&path, presented.refresh.expose());
+            let before = std::fs::read(&native).unwrap();
+            let options = SharedRefreshOptions {
+                native_publish: policy.clone(),
+                ..SharedRefreshOptions::default()
+            };
+            let outcome = client(&url)
+                .refresh_shared(&path, &presented, &options)
+                .await
+                .unwrap();
+            assert_eq!(outcome.source, RefreshSource::Refreshed, "{policy:?}");
+            assert_eq!(outcome.native_publish, None, "{policy:?}");
+            assert_eq!(std::fs::read(&native).unwrap(), before, "{policy:?}");
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
     }
 
     #[tokio::test]

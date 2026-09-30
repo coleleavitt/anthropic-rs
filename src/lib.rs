@@ -119,15 +119,22 @@ pub use cch::{
 pub use credentials::{
     FileSecretStore,
     NATIVE_CLAUDE_KEYRING_SERVICE,
+    NATIVE_PUBLISH_ENV,
     NativeClaudeCredentialSource,
     NativeClaudeImport,
+    NativeOAuthSummary,
+    NativePublish,
+    NativePublishOutcome,
     NativeTrustedDeviceToken,
     SecretStore,
     discover_native_claude_credentials,
     import_native_claude_file,
     native_claude_credentials_path,
+    native_claude_credentials_path_from_lookup,
     native_claude_keyring_account,
     native_claude_keyring_service,
+    publish_native_rotation,
+    read_native_claude_summary,
 };
 #[cfg(feature = "secure-store")]
 pub use credentials::{KeyringSecretStore, import_native_claude_keyring};
