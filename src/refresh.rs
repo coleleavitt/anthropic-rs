@@ -30,8 +30,8 @@
 //! 5. The token endpoint is called once, bounded by a deadline shorter than
 //!    the claim ([`refresh_deadline`]). Only HTTP 400 `invalid_grant` records
 //!    the fingerprint as dead (locally, and durably when the store still
-//!    holds that token); every other failure is transient and is noted
-//!    against the token without marking it.
+//!    holds that token); every other failure is transient and leaves the
+//!    row untouched.
 //! 6. The rotation is committed with compare-and-swap on the presented token
 //!    and the still-live claim; a result obtained under a lapsed claim is
 //!    discarded. A lost race adopts the winner's session when it is usable
@@ -410,26 +410,10 @@ impl OAuthClient {
                 let _ = AccountStore::mark_refresh_token_dead_at(path, account_id, &spend.refresh);
                 return Err(error.into_revocation().unwrap_or_else(|other| other));
             }
-            Ok(Err(error)) => {
-                let _ = AccountStore::mutate(path, |store| {
-                    Ok(store.record_refresh_error(
-                        account_id,
-                        &spend.refresh,
-                        &format!("refresh failed: {error}"),
-                    ))
-                });
-                return Err(error);
-            }
-            Err(_) => {
-                let _ = AccountStore::mutate(path, |store| {
-                    Ok(store.record_refresh_error(
-                        account_id,
-                        &spend.refresh,
-                        "refresh failed: token endpoint timed out",
-                    ))
-                });
-                return Err(Error::Timeout("oauth token refresh".into()));
-            }
+            // Transient: nothing about the token is recorded; the claim is
+            // released by the caller.
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(Error::Timeout("oauth token refresh".into())),
         };
         let committed = AccountStore::commit_refresh_at(
             path,
@@ -1160,12 +1144,12 @@ mod tests {
         assert_eq!(seen.lock().unwrap().len(), 1);
         let row = AccountStore::load(&path).unwrap();
         let row = row.get("shared").unwrap();
-        // Nothing committed, nothing marked dead, the claim released, and the
-        // failure noted against this token only.
+        // Nothing committed, nothing marked dead, no error recorded, and the
+        // claim released rather than left to lapse.
         assert_eq!(row.oauth().unwrap().refresh, presented.refresh);
         assert!(!row.refresh_token_is_dead());
         assert!(row.refresh_lease.is_none());
-        assert!(row.current_error().is_some_and(|e| e.contains("timed out")));
+        assert!(row.last_error.is_none());
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

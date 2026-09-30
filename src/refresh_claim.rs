@@ -149,7 +149,9 @@ impl AccountStore {
 
     /// Record a refresh failure that is *not* a dead-token verdict (a
     /// transport error, a 5xx, a timeout) against the token that was
-    /// presented. Only the token the account still holds is annotated, and the
+    /// presented. The ordinary refresh path does not call this (a transient
+    /// failure leaves the row untouched); the keep-alive pass does, so an
+    /// operator can see why an idle account was not kept alive. Only the token the account still holds is annotated, and the
     /// note is bound to it, so it expires with the next rotation. Never marks
     /// the token dead. Returns whether anything changed.
     pub fn record_refresh_error(

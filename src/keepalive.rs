@@ -380,11 +380,28 @@ impl crate::oauth::OAuthClient {
                         report.refreshed.push((current.id.clone(), reason));
                     }
                     Ok(_) => report.adopted.push(current.id.clone()),
-                    Err(error) => report.failed.push(KeepAliveFailure {
-                        account_id: current.id.clone(),
-                        failure: classify_refresh_failure(&error),
-                        message: crate::token::redact_secrets(&error.to_string()),
-                    }),
+                    Err(error) => {
+                        let failure = classify_refresh_failure(&error);
+                        let message = crate::token::redact_secrets(&error.to_string());
+                        // A dead verdict is already recorded by the refresh
+                        // path; anything else is noted against this token so
+                        // an operator can see why the account was not kept
+                        // alive. Bound to the token, it clears on rotation.
+                        if failure != crate::refresh::RefreshFailure::Revoked {
+                            let _ = AccountStore::mutate(path, |store| {
+                                Ok(store.record_refresh_error(
+                                    &current.id,
+                                    &tokens.refresh,
+                                    &format!("keep-alive refresh failed: {message}"),
+                                ))
+                            });
+                        }
+                        report.failed.push(KeepAliveFailure {
+                            account_id: current.id.clone(),
+                            failure,
+                            message,
+                        });
+                    }
                 }
             }
             Ok::<(), crate::Error>(())
@@ -747,6 +764,51 @@ mod tests {
             let unique: std::collections::HashSet<_> = presented.iter().collect();
             assert_eq!(unique.len(), 2);
             assert!(AccountStore::load(&path).unwrap().keepalive.is_none());
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+
+        #[tokio::test]
+        async fn a_failed_keepalive_refresh_is_reported_and_noted_on_the_token() {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut chunk = [0u8; 8192];
+                    let _ = stream.read(&mut chunk).await;
+                    let body = r#"{"error":"server_error"}"#;
+                    let response = format!(
+                        "HTTP/1.1 503 X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                }
+            });
+            let path = store_path("failed");
+            AccountStore {
+                accounts: vec![real_row("expiring", Duration::hours(-1), Duration::days(3))],
+                ..AccountStore::default()
+            }
+            .save(&path)
+            .unwrap();
+            let report = client(&format!("http://{address}/v1/oauth/token"))
+                .keep_alive_once(&path, Utc::now(), &fast())
+                .await
+                .unwrap();
+            assert!(report.refreshed.is_empty());
+            assert_eq!(report.failed.len(), 1);
+            assert_eq!(
+                report.failed[0].failure,
+                crate::refresh::RefreshFailure::Error
+            );
+            let row = AccountStore::load(&path).unwrap();
+            let row = row.get("expiring").unwrap();
+            assert!(!row.refresh_token_is_dead());
+            assert!(
+                row.current_error()
+                    .is_some_and(|e| e.starts_with("keep-alive refresh failed"))
+            );
             std::fs::remove_dir_all(path.parent().unwrap()).ok();
         }
 
