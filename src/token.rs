@@ -100,6 +100,14 @@ fn is_valid_sk_ant_token(s: &str, prefix: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// The last four characters of a secret, for display next to a masked key.
+/// Never more than four, so a short value is not echoed whole unless it is
+/// four characters or fewer.
+pub fn key_suffix(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    chars[chars.len().saturating_sub(4)..].iter().collect()
+}
+
 /// Replace any `sk-ant-…` token run with a placeholder so error bodies and log
 /// lines are safe to emit. Char-boundary safe.
 pub fn redact_secrets(input: &str) -> String {

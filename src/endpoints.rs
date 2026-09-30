@@ -78,6 +78,10 @@ pub const REDIRECT_URI_ENV: &str = "ANTHROPIC_OAUTH_REDIRECT_URI";
 /// Environment variable that overrides [`USAGE_URL`].
 pub const USAGE_URL_ENV: &str = "ANTHROPIC_OAUTH_USAGE_URL";
 
+/// Environment variable that overrides the profile endpoint
+/// ([`crate::profile::PROFILE_URL`]) used for identity backfill.
+pub const PROFILE_URL_ENV: &str = "ANTHROPIC_OAUTH_PROFILE_URL";
+
 /// Environment variable that turns on OAuth test mode: any OAuth HTTP call to
 /// a non-loopback host fails closed with
 /// [`Error::Config`](crate::Error::Config). Any value other than empty, `0`,

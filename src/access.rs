@@ -91,8 +91,13 @@ pub enum AccessErrorKind {
     /// Every refreshable account's refresh token is dead or expired; a
     /// re-login is needed.
     InvalidGrant,
-    /// The store or the request is unusable (unreadable store, bad option).
+    /// A bad option, or OAuth test mode refused a non-loopback host.
     Config,
+    /// A caller-supplied token or key is malformed (wrong shape, wrong kind).
+    InvalidToken,
+    /// The store file is unusable: not valid JSON, a symlink, or a shape
+    /// this crate cannot read. Nothing was written.
+    StoreCorrupt,
     /// Retry later: rate limits, a refresh claim held elsewhere, transport
     /// errors, timeouts.
     Transient,
@@ -100,16 +105,30 @@ pub enum AccessErrorKind {
 
 impl AccessErrorKind {
     /// The stable wire code (`auth_required`, `quota_reserve`,
-    /// `invalid_grant`, `config`, `transient`).
+    /// `invalid_grant`, `config`, `invalid_token`, `store_corrupt`,
+    /// `transient`).
     pub fn code(self) -> &'static str {
         match self {
             Self::AuthRequired => "auth_required",
             Self::QuotaReserve => "quota_reserve",
             Self::InvalidGrant => "invalid_grant",
             Self::Config => "config",
+            Self::InvalidToken => "invalid_token",
+            Self::StoreCorrupt => "store_corrupt",
             Self::Transient => "transient",
         }
     }
+
+    /// Every kind, for bindings that publish the code list.
+    pub const ALL: [Self; 7] = [
+        Self::AuthRequired,
+        Self::QuotaReserve,
+        Self::InvalidGrant,
+        Self::Config,
+        Self::InvalidToken,
+        Self::StoreCorrupt,
+        Self::Transient,
+    ];
 }
 
 /// A classified failure of [`get_access_token`]. The message is redacted.
@@ -123,7 +142,8 @@ pub struct AccessError {
 }
 
 impl AccessError {
-    fn new(kind: AccessErrorKind, message: impl Into<String>) -> Self {
+    /// A classified error with a redacted message.
+    pub fn new(kind: AccessErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: crate::token::redact_secrets(&message.into()),
@@ -137,10 +157,10 @@ impl AccessError {
                 AccessErrorKind::InvalidGrant
             }
             Error::NoUsableAccount(_) | Error::UnknownAccount(_) => AccessErrorKind::AuthRequired,
-            Error::StoreIsSymlink
-            | Error::InvalidJson { .. }
-            | Error::Serde(_)
-            | Error::WouldDeleteAllAccounts
+            Error::StoreIsSymlink | Error::InvalidJson { .. } | Error::Serde(_) => {
+                AccessErrorKind::StoreCorrupt
+            }
+            Error::WouldDeleteAllAccounts
             | Error::CustodyTombstone { .. }
             | Error::Config(_)
             | Error::Url(_) => AccessErrorKind::Config,
@@ -410,6 +430,102 @@ pub async fn get_access_token(
     Err(transient.unwrap_or_else(|| {
         AccessError::new(AccessErrorKind::Transient, "no account could be refreshed")
     }))
+}
+
+/// A static API key from an `api_key` store row. `Debug` never shows the key.
+#[derive(Clone)]
+pub struct ApiKeyGrant {
+    /// Send as `x-api-key`.
+    pub api_key: String,
+    /// The store row it belongs to.
+    pub account_id: String,
+    /// The row's label.
+    pub label: Option<String>,
+}
+
+impl std::fmt::Debug for ApiKeyGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeyGrant")
+            .field("api_key", &"***")
+            .field("account_id", &self.account_id)
+            .field("label", &self.label)
+            .finish()
+    }
+}
+
+/// The last four characters of a key, for display (`listAccounts`).
+pub fn api_key_suffix(key: &str) -> String {
+    crate::token::key_suffix(key)
+}
+
+/// Resolve an API key from the store at `path`: `api_key` rows matching
+/// `request.account` / `request.allowlist` (id or label), enabled and not
+/// cooling down, the pinned `current` first. The quota reserve does not apply
+/// (API keys carry no plan-window reading).
+pub fn get_api_key(path: &Path, request: &AccessRequest) -> Result<ApiKeyGrant, AccessError> {
+    let now = Utc::now();
+    let store = AccountStore::load_or_migrate_from(path, &[])
+        .map_err(|e| AccessError::from_error(&e))?
+        .store;
+    let matching: Vec<&Account> = store
+        .accounts
+        .iter()
+        .filter(|a| matches!(a.credential, crate::Credential::ApiKey { .. }))
+        .filter(|a| {
+            request
+                .account
+                .as_deref()
+                .is_none_or(|sel| account_matches(a, sel))
+        })
+        .filter(|a| {
+            request.allowlist.is_empty() || request.allowlist.iter().any(|s| account_matches(a, s))
+        })
+        .collect();
+    if matching.is_empty() {
+        return Err(AccessError::new(
+            AccessErrorKind::AuthRequired,
+            match &request.account {
+                Some(sel) => format!("no API-key account matches {sel:?}"),
+                None => "no API-key account in the shared store".to_owned(),
+            },
+        ));
+    }
+    let enabled: Vec<&Account> = matching.into_iter().filter(|a| a.enabled).collect();
+    if enabled.is_empty() {
+        return Err(AccessError::new(
+            AccessErrorKind::AuthRequired,
+            "every matching API-key account is disabled",
+        ));
+    }
+    let mut available: Vec<&Account> = enabled
+        .iter()
+        .copied()
+        .filter(|a| a.is_available(now))
+        .collect();
+    if available.is_empty() {
+        return Err(AccessError::new(
+            AccessErrorKind::Transient,
+            "every matching API-key account is rate-limited",
+        ));
+    }
+    if let Some(current) = store.current.as_deref()
+        && let Some(pos) = available.iter().position(|a| a.id == current)
+    {
+        let pinned = available.remove(pos);
+        available.insert(0, pinned);
+    }
+    let account = available[0];
+    let crate::Credential::ApiKey { key } = &account.credential else {
+        return Err(AccessError::new(
+            AccessErrorKind::AuthRequired,
+            "not an API-key account",
+        ));
+    };
+    Ok(ApiKeyGrant {
+        api_key: key.expose().to_owned(),
+        account_id: account.id.clone(),
+        label: account.label.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -704,5 +820,102 @@ mod tests {
                 .kind,
             AccessErrorKind::AuthRequired
         );
+    }
+
+    fn api_row(id: &str, key: &str) -> Account {
+        let mut account = Account::new(
+            id,
+            Credential::ApiKey {
+                key: crate::token::ApiKey::new(key),
+            },
+        );
+        account.label = Some(format!("{id} label"));
+        account
+    }
+
+    const KEY_A: &str = "sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaA1b2";
+    const KEY_B: &str = "sk-ant-api03-bbbbbbbbbbbbbbbbbbbbbbbbbbbbC3d4";
+
+    #[test]
+    fn api_keys_are_selected_by_id_label_pin_and_availability() {
+        let path = store_at(
+            "api-keys",
+            vec![
+                row("oauth", Duration::hours(1)),
+                api_row("k1", KEY_A),
+                api_row("k2", KEY_B),
+            ],
+        );
+        let first = get_api_key(&path, &AccessRequest::default()).unwrap();
+        assert_eq!(
+            (first.account_id.as_str(), first.api_key.as_str()),
+            ("k1", KEY_A)
+        );
+        assert!(!format!("{first:?}").contains(KEY_A), "Debug hides the key");
+        let by_label = get_api_key(
+            &path,
+            &AccessRequest {
+                account: Some("K2 LABEL".into()),
+                ..AccessRequest::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(by_label.api_key, KEY_B);
+        // An OAuth row is never handed out as an API key.
+        let error = get_api_key(
+            &path,
+            &AccessRequest {
+                account: Some("oauth".into()),
+                ..AccessRequest::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, AccessErrorKind::AuthRequired);
+        // The pin wins; a disabled or cooling key is skipped.
+        AccountStore::mutate(&path, |store| {
+            store.current = Some("k2".into());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            get_api_key(&path, &AccessRequest::default())
+                .unwrap()
+                .account_id,
+            "k2"
+        );
+        AccountStore::mutate(&path, |store| {
+            store
+                .get_mut("k2")?
+                .mark_rate_limited(Utc::now() + Duration::minutes(5));
+            store.get_mut("k1")?.enabled = false;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            get_api_key(&path, &AccessRequest::default())
+                .unwrap_err()
+                .kind,
+            AccessErrorKind::Transient
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn an_unreadable_store_is_store_corrupt_not_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "anthropic-access-corrupt-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.json");
+        std::fs::write(&path, b"{ not json").unwrap();
+        let error = get_api_key(&path, &AccessRequest::default()).unwrap_err();
+        assert_eq!(error.kind, AccessErrorKind::StoreCorrupt, "{error}");
+        assert_eq!(error.kind.code(), "store_corrupt");
+        assert_eq!(api_key_suffix(KEY_A), "A1b2");
+        assert_eq!(api_key_suffix("ab"), "ab");
+        let codes: Vec<&str> = AccessErrorKind::ALL.iter().map(|k| k.code()).collect();
+        assert!(codes.contains(&"invalid_token") && codes.contains(&"config"));
+        std::fs::remove_dir_all(dir).ok();
     }
 }

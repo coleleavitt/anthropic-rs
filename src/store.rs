@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::account::Account;
 use crate::error::{Error, Result};
-use crate::token::{Credential, OAuthTokens, RefreshToken};
+use crate::token::{ApiKey, Credential, OAuthTokens, RefreshToken};
 
 /// Environment variable naming the store file outright.
 pub const STORE_FILE_ENV: &str = "ANTHROPIC_ACCOUNTS_FILE";
@@ -163,14 +163,28 @@ pub fn default_store_path() -> PathBuf {
 /// Legacy per-application store locations, newest convention first. These are
 /// read-only fallbacks used to adopt an existing login into the shared store.
 pub fn legacy_store_paths() -> Vec<PathBuf> {
+    legacy_store_paths_from_lookup(|key| std::env::var(key).ok())
+}
+
+/// [`legacy_store_paths`] over an arbitrary variable lookup (`HOME`,
+/// `USERPROFILE`, `GROK_HOME`, [`STORE_DIR_ENV`]); a JS host passes its own
+/// environment snapshot.
+pub fn legacy_store_paths_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Vec<PathBuf> {
+    let get = |key: &str| lookup(key).filter(|v| !v.is_empty()).map(PathBuf::from);
+    let home = get("HOME").or_else(|| get("USERPROFILE"));
+    let store_dir = get(STORE_DIR_ENV).unwrap_or_else(|| {
+        home.clone()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(STORE_DIR_NAME)
+    });
     // Predecessors wrote this name into the shared directory itself, so it sits
     // beside the canonical file and is the most likely place to find accounts
     // that were never migrated.
-    let mut paths = vec![store_dir().join("anthropic-accounts.json")];
-    if let Some(grok_home) = non_empty_env_path("GROK_HOME") {
+    let mut paths = vec![store_dir.join("anthropic-accounts.json")];
+    if let Some(grok_home) = get("GROK_HOME") {
         paths.push(grok_home.join("anthropic-accounts.json"));
     }
-    if let Some(home) = home_dir() {
+    if let Some(home) = home {
         paths.push(home.join(".config/jfc/anthropic-accounts.json"));
         paths.push(home.join(".grok/anthropic-accounts.json"));
         paths.push(home.join(".config/opencode/anthropic-accounts.json"));
@@ -421,6 +435,53 @@ impl AccountStore {
         })
     }
 
+    /// Fold `legacy` stores into the canonical store at `canonical` and
+    /// persist what they add: [`Self::load_or_migrate_from`] followed by a
+    /// locked, append-only [`Self::merge_adopted`]. Rows dead by definition
+    /// (disabled with `invalid_grant`, no refresh token) are skipped by the
+    /// legacy reader; a scanned file is recorded in `migrated_from` so it is
+    /// never re-read and a removed account is never resurrected. Nothing is
+    /// written when there is nothing new, and an empty canonical store is
+    /// never created. Returns how many rows were added.
+    pub fn adopt_legacy(canonical: &Path, legacy: &[PathBuf]) -> Result<usize> {
+        if legacy.is_empty() {
+            return Ok(0);
+        }
+        let before = if canonical.exists() {
+            Some(Self::load(canonical)?)
+        } else {
+            None
+        };
+        let loaded = Self::load_or_migrate_from(canonical, legacy)?;
+        let known: HashSet<String> = before
+            .iter()
+            .flat_map(|store| store.accounts.iter().flat_map(account_identities))
+            .collect();
+        let rows: Vec<Account> = loaded
+            .store
+            .accounts
+            .iter()
+            .filter(|a| !account_identities(a).iter().any(|k| known.contains(k)))
+            .cloned()
+            .collect();
+        let recorded: HashSet<&String> = before
+            .iter()
+            .flat_map(|store| store.migrated_from.iter())
+            .collect();
+        let scanned: Vec<String> = loaded
+            .store
+            .migrated_from
+            .iter()
+            .filter(|p| !recorded.contains(p))
+            .cloned()
+            .collect();
+        let has_rows = before.as_ref().is_some_and(|b| !b.accounts.is_empty());
+        if rows.is_empty() && (scanned.is_empty() || !has_rows) {
+            return Ok(0);
+        }
+        Self::merge_adopted(canonical, &rows, &scanned)
+    }
+
     /// Install a freshly logged-in credential. When a row already holds the
     /// same login (any shared identity: id, account uuid + organization,
     /// email + organization, token), that row is updated **in place**: its
@@ -461,6 +522,39 @@ impl AccountStore {
         existing.dead_refresh_fingerprint = None;
         existing.refresh_lease = None;
         Ok(existing.id.clone())
+    }
+
+    /// Add a static API key (in-memory form; persist with
+    /// [`AccountStore::mutate`]). A row that already holds this exact key is
+    /// kept as it is (`added == false`). A new row is keyed by `label` (else
+    /// `api-key-<last 4>`), suffixed `-2`, `-3`, … when that id is taken, so
+    /// an API key never lands on another row. Returns `(id, added)`.
+    pub fn add_api_key(&mut self, label: Option<&str>, key: ApiKey) -> (String, bool) {
+        let identity = format!("api_key:{}", key.expose());
+        if let Some(existing) = self
+            .accounts
+            .iter()
+            .find(|a| account_identities(a).contains(&identity))
+        {
+            return (existing.id.clone(), false);
+        }
+        let label = label.map(str::trim).filter(|l| !l.is_empty());
+        let base = label
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("api-key-{}", crate::token::key_suffix(key.expose())));
+        let mut id = base.clone();
+        let mut n = 2;
+        while self.accounts.iter().any(|a| a.id == id) {
+            id = format!("{base}-{n}");
+            n += 1;
+        }
+        let mut account = Account::new(id.clone(), Credential::ApiKey { key });
+        account.label = label.map(str::to_owned);
+        self.accounts.push(account);
+        if self.current.is_none() {
+            self.current = Some(id.clone());
+        }
+        (id, true)
     }
 
     /// Compare-and-swap an OAuth refresh result into the latest store. Returns
@@ -1301,6 +1395,117 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn adopt_legacy_persists_new_rows_once_and_never_resurrects() {
+        let dir = tmp_dir("adopt-legacy");
+        let canonical = dir.join("accounts.json");
+        let legacy = dir.join("anthropic-accounts.json");
+        store_with(&["native-claude"]).save(&canonical).unwrap();
+        let mut dead = flat_legacy_json("dead", "sk-ant-ort01-dead", false);
+        dead["disabledReason"] = serde_json::json!("invalid_grant");
+        write_flat_legacy(
+            &legacy,
+            vec![flat_legacy_json("one", "sk-ant-ort01-one", true), dead],
+        );
+        let paths = std::slice::from_ref(&legacy);
+        assert_eq!(AccountStore::adopt_legacy(&canonical, paths).unwrap(), 1);
+        let stored = AccountStore::load(&canonical).unwrap();
+        let ids: Vec<&str> = stored.accounts.iter().map(|a| a.id.as_str()).collect();
+        // The dead row (disabled with invalid_grant) is skipped.
+        assert_eq!(ids, ["native-claude", "one"]);
+        assert_eq!(stored.migrated_from, [legacy.to_string_lossy().to_string()]);
+        // A second pass reads nothing and writes nothing; a removed row stays
+        // removed.
+        AccountStore::mutate(&canonical, |store| {
+            store.remove("one");
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(AccountStore::adopt_legacy(&canonical, paths).unwrap(), 0);
+        assert!(AccountStore::load(&canonical).unwrap().get("one").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn adopt_legacy_creates_the_canonical_store_only_with_rows() {
+        let dir = tmp_dir("adopt-legacy-empty");
+        let canonical = dir.join("accounts.json");
+        let empty = dir.join("empty-legacy.json");
+        write_flat_legacy(&empty, vec![]);
+        assert_eq!(
+            AccountStore::adopt_legacy(&canonical, std::slice::from_ref(&empty)).unwrap(),
+            0
+        );
+        assert!(!canonical.exists(), "no empty store is created");
+        assert_eq!(AccountStore::adopt_legacy(&canonical, &[]).unwrap(), 0);
+        let legacy = dir.join("jfc.json");
+        write_flat_legacy(
+            &legacy,
+            vec![flat_legacy_json("one", "sk-ant-ort01-one", true)],
+        );
+        assert_eq!(
+            AccountStore::adopt_legacy(&canonical, &[empty, legacy]).unwrap(),
+            1
+        );
+        assert_eq!(AccountStore::load(&canonical).unwrap().accounts.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_paths_resolve_from_a_lookup() {
+        let env = |key: &str| match key {
+            "HOME" => Some("/h".to_owned()),
+            "GROK_HOME" => Some("/g".to_owned()),
+            _ => None,
+        };
+        let paths = legacy_store_paths_from_lookup(env);
+        let expected: Vec<PathBuf> = [
+            "/h/.anthropic-accounts/anthropic-accounts.json",
+            "/g/anthropic-accounts.json",
+            "/h/.config/jfc/anthropic-accounts.json",
+            "/h/.grok/anthropic-accounts.json",
+            "/h/.config/opencode/anthropic-accounts.json",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(paths, expected);
+        let dir_env = |key: &str| (key == STORE_DIR_ENV).then(|| "/s".to_owned());
+        assert_eq!(
+            legacy_store_paths_from_lookup(dir_env),
+            vec![PathBuf::from("/s/anthropic-accounts.json")]
+        );
+    }
+
+    #[test]
+    fn add_api_key_dedupes_and_never_lands_on_another_row() {
+        let mut store = AccountStore::default();
+        store.accounts.push(Account::new(
+            "work",
+            Credential::Oauth(oauth_tokens(
+                "sk-ant-ort01-workworkworkworkworkwork",
+                1_800_000_000,
+            )),
+        ));
+        let key = "sk-ant-api03-zzzzzzzzzzzzzzzzzzzzzzzzW9x8";
+        let (id, added) = store.add_api_key(Some("work"), ApiKey::new(key));
+        assert!(added);
+        assert_eq!(id, "work-2", "the OAuth row keeps its id and credential");
+        assert!(store.get("work").unwrap().credential.is_oauth());
+        assert_eq!(store.get("work-2").unwrap().label.as_deref(), Some("work"));
+        // The same key again is the same row.
+        assert_eq!(
+            store.add_api_key(Some("other"), ApiKey::new(key)),
+            ("work-2".into(), false)
+        );
+        let (unnamed, added) = store.add_api_key(
+            None,
+            ApiKey::new("sk-ant-api03-yyyyyyyyyyyyyyyyyyyyyyyyQ7r6"),
+        );
+        assert!(added);
+        assert_eq!(unnamed, "api-key-Q7r6");
     }
 
     #[test]

@@ -94,6 +94,8 @@ pub mod low_priority;
 pub mod refresh;
 #[cfg(feature = "store")]
 pub mod refresh_claim;
+#[cfg(all(feature = "client", feature = "store"))]
+pub mod revoke;
 #[cfg(feature = "store")]
 pub mod routing;
 #[cfg(feature = "store")]
@@ -247,8 +249,24 @@ pub struct LoginStart {
 
 /// Build the authorize URL plus its matching PKCE material.
 pub fn start_login(endpoints: &Endpoints) -> Result<LoginStart> {
+    start_login_with_state(endpoints, generate_state()?)
+}
+
+/// [`start_login`] with a caller-chosen anti-CSRF `state` (a loopback
+/// listener that already committed to one). The state must be 8–512
+/// URL-safe characters (`A-Z a-z 0-9 - . _ ~`); anything else is refused
+/// with [`Error::Config`].
+pub fn start_login_with_state(endpoints: &Endpoints, state: String) -> Result<LoginStart> {
+    if !(8..=512).contains(&state.len())
+        || !state
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+    {
+        return Err(Error::Config(
+            "login state must be 8-512 URL-safe characters".into(),
+        ));
+    }
     let pkce = PkcePair::generate()?;
-    let state = generate_state()?;
     let authorize_url = AuthorizeRequest {
         endpoints,
         pkce: &pkce,
@@ -294,5 +312,27 @@ mod tests {
             parse_redirect_code("the-code#tampered", &login.state),
             Err(Error::StateMismatch)
         ));
+    }
+
+    #[test]
+    fn start_login_with_state_carries_the_callers_state_and_refuses_unsafe_ones() {
+        let mut endpoints = Endpoints::prod();
+        endpoints.redirect_uri = "http://localhost:54545/callback".into();
+        let state = "loopback-state_0123456789abcdefABCDEF~.".to_owned();
+        let login = start_login_with_state(&endpoints, state.clone()).unwrap();
+        let pairs: std::collections::HashMap<_, _> =
+            login.authorize_url.query_pairs().into_owned().collect();
+        assert_eq!(pairs["state"], state);
+        assert_eq!(login.state, state);
+        assert_eq!(pairs["redirect_uri"], "http://localhost:54545/callback");
+        for bad in ["short", "has space in it", "a&b=cdefghij", &"x".repeat(513)] {
+            assert!(
+                matches!(
+                    start_login_with_state(&endpoints, bad.to_owned()),
+                    Err(Error::Config(_))
+                ),
+                "{bad:?}"
+            );
+        }
     }
 }

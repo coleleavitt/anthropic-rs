@@ -202,6 +202,95 @@ pub fn apply_identity_backfill(
     Ok(())
 }
 
+/// [`PROFILE_URL`], or [`crate::endpoints::PROFILE_URL_ENV`] when set.
+pub fn profile_url_from_lookup(lookup: impl Fn(&str) -> Option<String>) -> String {
+    lookup(crate::endpoints::PROFILE_URL_ENV)
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| PROFILE_URL.to_owned())
+}
+
+/// What an identity backfill did to one row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityBackfill {
+    /// The row now carries the profile's account uuid (and email /
+    /// organization when the profile had them).
+    Filled {
+        /// The email written, when the profile had one.
+        email: Option<String>,
+    },
+    /// Left alone (API key, already identified, or the profile had no
+    /// account uuid).
+    Skipped(BackfillSkip),
+    /// Left alone: its access token is not live, and a backfill never spends
+    /// a refresh token.
+    NoLiveAccessToken,
+    /// Left alone: the row changed while the profile was being fetched.
+    Changed,
+}
+
+/// Fill the identity of every OAuth row in the store at `path` that has
+/// none (an imported native or host credential carries only a token pair),
+/// from `GET profile_url` with the row's live access token. Rows whose access
+/// token is expired are skipped, never refreshed. In OAuth test mode
+/// (`test_mode`, or the environment) a non-loopback `profile_url` is never
+/// contacted. Each write re-checks under the store lock that the row still
+/// holds the same access token and still lacks an identity.
+#[cfg(all(feature = "client", feature = "store"))]
+pub async fn backfill_store_identities(
+    http: &reqwest::Client,
+    profile_url: &str,
+    path: &std::path::Path,
+    test_mode: bool,
+) -> crate::Result<Vec<(String, IdentityBackfill)>> {
+    crate::endpoints::check_oauth_url(
+        profile_url,
+        test_mode || crate::endpoints::oauth_test_mode(),
+    )?;
+    let now = chrono::Utc::now();
+    let store = crate::store::AccountStore::load_or_migrate_from(path, &[])?.store;
+    let mut report = Vec::new();
+    for account in &store.accounts {
+        if let Err(skip) = needs_identity_backfill(account) {
+            report.push((account.id.clone(), IdentityBackfill::Skipped(skip)));
+            continue;
+        }
+        let Some(tokens) = account.oauth() else {
+            continue;
+        };
+        if tokens.access.expose().is_empty() || tokens.is_expired(now) {
+            report.push((account.id.clone(), IdentityBackfill::NoLiveAccessToken));
+            continue;
+        }
+        let access = tokens.access.clone();
+        let identity = fetch_oauth_account_identity_from(http, profile_url, access.expose()).await;
+        if !identity.is_identified() {
+            report.push((
+                account.id.clone(),
+                IdentityBackfill::Skipped(BackfillSkip::ProfileUnavailable),
+            ));
+            continue;
+        }
+        let id = account.id.clone();
+        let result = crate::store::AccountStore::mutate(path, |store| {
+            let Ok(row) = store.get_mut(&id) else {
+                return Ok(IdentityBackfill::Changed);
+            };
+            if row.oauth().map(|t| &t.access) != Some(&access) {
+                return Ok(IdentityBackfill::Changed);
+            }
+            Ok(match apply_identity_backfill(row, &identity) {
+                Ok(()) => IdentityBackfill::Filled {
+                    email: identity.email.clone(),
+                },
+                Err(skip) => IdentityBackfill::Skipped(skip),
+            })
+        })?;
+        report.push((id, result));
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +369,180 @@ mod tests {
             apply_identity_backfill(&mut key, &identity),
             Err(BackfillSkip::NotOauth)
         );
+    }
+
+    #[cfg(all(feature = "client", feature = "store"))]
+    mod store_backfill {
+        use chrono::{Duration, Utc};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        use super::super::*;
+        use crate::store::AccountStore;
+        use crate::token::{AccessToken, ApiKey, OAuthTokens, RefreshToken};
+
+        /// A profile endpoint that answers `body` to any GET carrying
+        /// `Bearer <live>`, 401 otherwise; counts requests.
+        async fn profile_server(
+            live: &'static str,
+            body: &'static str,
+        ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let url = format!(
+                "http://{}/api/oauth/profile",
+                listener.local_addr().unwrap()
+            );
+            let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = hits.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (status, reply) = if head.contains(&format!("Bearer {live}")) {
+                        ("200 OK", body)
+                    } else {
+                        ("401 Unauthorized", "{}")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                }
+            });
+            (url, hits)
+        }
+
+        fn oauth(id: &str, access: &str, expires_in: Duration) -> Account {
+            Account::new(
+                id,
+                Credential::Oauth(OAuthTokens {
+                    access: AccessToken::new(access),
+                    refresh: RefreshToken::new(format!("sk-ant-ort01-{id}-rrrrrrrrrrrrrrrrrrrr")),
+                    expires_at: Utc::now() + expires_in,
+                    refresh_expires_at: None,
+                    scopes: vec!["user:inference".into()],
+                    account: None,
+                    organization: None,
+                }),
+            )
+        }
+
+        const LIVE: &str = "sk-ant-oat01-liveliveliveliveliveliveli";
+
+        #[tokio::test]
+        async fn fills_unidentified_live_rows_and_never_refreshes() {
+            let (url, hits) = profile_server(LIVE, super::PROFILE).await;
+            let dir = std::env::temp_dir().join(format!(
+                "anthropic-backfill-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("accounts.json");
+            let mut identified = oauth(
+                "known",
+                "sk-ant-oat01-knownknownknownknownkn",
+                Duration::hours(1),
+            );
+            if let Credential::Oauth(t) = &mut identified.credential {
+                t.account = Some(TokenAccount {
+                    uuid: "acc-0".into(),
+                    email_address: None,
+                });
+            }
+            AccountStore {
+                accounts: vec![
+                    oauth("native", LIVE, Duration::hours(1)),
+                    oauth(
+                        "expired",
+                        "sk-ant-oat01-expiredexpiredexpiredex",
+                        Duration::hours(-1),
+                    ),
+                    identified,
+                    Account::new(
+                        "key",
+                        Credential::ApiKey {
+                            key: ApiKey::new("sk-ant-api03-kkkkkkkkkkkkkkkkkkkkkkkk"),
+                        },
+                    ),
+                ],
+                ..AccountStore::default()
+            }
+            .save(&path)
+            .unwrap();
+            let report = backfill_store_identities(&reqwest::Client::new(), &url, &path, true)
+                .await
+                .unwrap();
+            assert_eq!(
+                report,
+                vec![
+                    (
+                        "native".into(),
+                        IdentityBackfill::Filled {
+                            email: Some("me@example.com".into())
+                        }
+                    ),
+                    ("expired".into(), IdentityBackfill::NoLiveAccessToken),
+                    (
+                        "known".into(),
+                        IdentityBackfill::Skipped(BackfillSkip::AlreadyIdentified)
+                    ),
+                    (
+                        "key".into(),
+                        IdentityBackfill::Skipped(BackfillSkip::NotOauth)
+                    ),
+                ]
+            );
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let stored = AccountStore::load(&path).unwrap();
+            let native = stored.get("native").unwrap();
+            assert_eq!(native.email.as_deref(), Some("me@example.com"));
+            let tokens = native.oauth().unwrap();
+            assert_eq!(tokens.account.as_ref().unwrap().uuid, "acc-1");
+            assert_eq!(tokens.organization.as_ref().unwrap().uuid, "org-1");
+            std::fs::remove_dir_all(dir).ok();
+        }
+
+        #[tokio::test]
+        async fn test_mode_never_contacts_a_production_profile_host() {
+            let dir = std::env::temp_dir().join(format!(
+                "anthropic-backfill-tm-{}",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("accounts.json");
+            AccountStore {
+                accounts: vec![oauth("native", LIVE, Duration::hours(1))],
+                ..AccountStore::default()
+            }
+            .save(&path)
+            .unwrap();
+            let error =
+                backfill_store_identities(&reqwest::Client::new(), PROFILE_URL, &path, true)
+                    .await
+                    .unwrap_err();
+            assert!(matches!(error, crate::Error::Config(_)), "{error}");
+            assert!(
+                AccountStore::load(&path)
+                    .unwrap()
+                    .get("native")
+                    .unwrap()
+                    .email
+                    .is_none()
+            );
+            assert_eq!(
+                profile_url_from_lookup(|_| None),
+                PROFILE_URL,
+                "production unless overridden"
+            );
+            assert_eq!(
+                profile_url_from_lookup(|_| Some(" http://127.0.0.1:9/p ".into())),
+                "http://127.0.0.1:9/p"
+            );
+            std::fs::remove_dir_all(dir).ok();
+        }
     }
 }
