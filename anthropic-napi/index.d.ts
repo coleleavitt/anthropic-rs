@@ -2,7 +2,7 @@
 //
 // Refresh tokens never cross into JavaScript: no value returned by this API
 // carries one. The only method that accepts one (`importOAuthAccount`) moves
-// it into the store.
+// it into the store. API keys are handed out only by `getApiKey`.
 //
 // Timestamps are epoch milliseconds. Every method rejects/throws an
 // `AnthropicAuthError` whose `code` is one of `ErrorCode`.
@@ -13,6 +13,8 @@ export type ErrorCode =
   | 'quota_reserve'
   | 'invalid_grant'
   | 'config'
+  | 'invalid_token'
+  | 'store_corrupt'
   | 'transient'
 
 export declare const ERROR_CODES: ErrorCode[]
@@ -23,7 +25,10 @@ export declare class AnthropicAuthError extends Error {
    * - `auth_required`: no account can serve (none, none matching, all disabled); log in.
    * - `quota_reserve`: every otherwise usable account is at/above the reserve or exhausted.
    * - `invalid_grant`: every refreshable account's refresh token is dead/expired; re-login.
-   * - `config`: unusable store or option, or OAuth test mode refused a non-loopback host.
+   * - `config`: a bad option, or OAuth test mode refused a non-loopback host.
+   * - `invalid_token`: a token or key passed in is malformed (wrong shape or kind).
+   * - `store_corrupt`: the store (or Claude Code's credential file) is not valid JSON,
+   *   is a symlink, or is group/world readable; nothing was written.
    * - `transient`: retry later (rate limit, refresh claim held elsewhere, network, timeout).
    */
   readonly code: ErrorCode
@@ -54,6 +59,30 @@ export interface AuthConfig {
   redirectUri?: string | null
   /** OAuth client id. */
   clientId?: string | null
+  /** Refresh-token revocation endpoint (`ANTHROPIC_OAUTH_REVOKE_URL`). */
+  revokeUrl?: string | null
+  /** Profile endpoint for identity backfill (`ANTHROPIC_OAUTH_PROFILE_URL`). */
+  profileUrl?: string | null
+  /**
+   * Legacy per-application stores to adopt (flat `~/.grok` / `~/.config/jfc`
+   * files). Default: the crate's list (`<store dir>/anthropic-accounts.json`,
+   * `$GROK_HOME`, `~/.config/jfc`, `~/.grok`, `~/.config/opencode`) when the
+   * store is the default one, none otherwise. `[]` turns adoption off. Rows
+   * disabled with `invalid_grant` or without a refresh token are never adopted.
+   */
+  legacyPaths?: string[] | null
+  /**
+   * Publish a rotation to Claude Code's credential file when it still holds
+   * the spent refresh token (default `'auto'`; `ANTHROPIC_NATIVE_PUBLISH=0`
+   * also turns it off). In OAuth test mode only `nativeCredentialsPath` is used.
+   */
+  nativePublish?: 'auto' | 'off' | null
+  /**
+   * Claude Code's credential file. Default: `$CLAUDE_SECURESTORAGE_CONFIG_DIR`,
+   * else `$CLAUDE_CONFIG_DIR`, else `~/.claude`, joined with `.credentials.json`
+   * (never resolved in OAuth test mode).
+   */
+  nativeCredentialsPath?: string | null
 }
 
 export interface QuotaInfo {
@@ -88,6 +117,8 @@ export interface AccountInfo {
   accountUuid?: string
   organizationUuid?: string
   scopes: string[]
+  /** `api_key` rows: the key's last four characters (never the key). */
+  apiKeySuffix?: string
 }
 
 export interface GetAccessTokenOptions {
@@ -167,6 +198,10 @@ export interface StartLoginOptions {
   /** `max` (Claude.ai subscription, default) or `console`. */
   mode?: 'max' | 'console' | null
   loginHint?: string | null
+  /** Redirect URI for this login only (a loopback listener's). */
+  redirectUri?: string | null
+  /** Anti-CSRF state for this login (8-512 URL-safe chars). Default: random. */
+  state?: string | null
 }
 
 /** A login in progress. The PKCE verifier stays in Rust. */
@@ -224,6 +259,91 @@ export interface UnauthorizedResult {
   failureCode?: ErrorCode
 }
 
+export interface ExchangeCodeOptions {
+  loginId: string
+  /** As for `completeLogin`. */
+  callback: string
+}
+
+/** A code exchanged without storing anything; the refresh token is dropped in Rust. */
+export interface ExchangedAccess {
+  accessToken: string
+  expiresAt: number
+  scopes: string[]
+  accountUuid?: string
+  email?: string
+  organizationUuid?: string
+}
+
+export interface AddApiKeyOptions {
+  label?: string | null
+  /** An `sk-ant-api…` key. */
+  key: string
+}
+
+export interface AddApiKeyResult {
+  accountId: string
+  status: 'added' | 'already_present'
+}
+
+export interface GetApiKeyOptions {
+  /** Use only this account (id or label). */
+  account?: string | null
+  /** Consider only these accounts (ids or labels). */
+  allowlist?: string[] | null
+}
+
+/** Send `apiKey` as `x-api-key`. Never log it. */
+export interface ApiKeyCredential {
+  apiKey: string
+  accountId: string
+  label?: string
+}
+
+export interface RevokeAccountOptions {
+  accountId: string
+  /** Keep the row, disabled with its token recorded dead, instead of removing it. */
+  disable?: boolean | null
+}
+
+export interface RevokeAccountResult {
+  accountId: string
+  /** `not_sent`: the token was already recorded dead, no request was needed. */
+  outcome: 'revoked' | 'already_inactive' | 'not_sent'
+  removed: boolean
+}
+
+export interface BackfillEntry {
+  accountId: string
+  status:
+    | 'filled'
+    | 'not_oauth'
+    | 'already_identified'
+    | 'profile_unavailable'
+    | 'no_live_access_token'
+    | 'changed'
+  email?: string
+}
+
+export interface NativeClaudeOptions {
+  /** Claude Code's credential file (default: the handle's). */
+  path?: string | null
+  /** Label for an imported row (default `Claude Code`). */
+  label?: string | null
+}
+
+/** Non-secret facts about Claude Code's credential file. */
+export interface NativeClaudeInfo {
+  path: string
+  expiresAt: number
+  refreshExpiresAt?: number
+  scopes: string[]
+  subscriptionType?: string
+  rateLimitTier?: string
+  /** The store row holding the same refresh token (its refreshes are published back). */
+  storeAccountId?: string
+}
+
 /** A handle on one shared store. Safe to share; every method is independent. */
 export declare class AnthropicAuth {
   constructor(config?: AuthConfig | null)
@@ -260,6 +380,20 @@ export declare class AnthropicAuth {
   importOAuthAccount(options: ImportOAuthAccountOptions): Promise<ImportResult>
   /** One claimed refresh after an upstream 401; retry only on a new bearer. */
   handleUnauthorized(options: HandleUnauthorizedOptions): Promise<UnauthorizedResult>
+  /** Exchange a login's code without storing anything (Console API-key mint). */
+  exchangeCode(options: ExchangeCodeOptions): Promise<ExchangedAccess>
+  /** Store a static API key as an `api_key` row. */
+  addApiKey(options: AddApiKeyOptions): Promise<AddApiKeyResult>
+  /** A static API key from an `api_key` row (pin first; enabled, not cooling down). */
+  getApiKey(options?: GetApiKeyOptions | null): Promise<ApiKeyCredential>
+  /** Revoke an OAuth row's refresh token, then remove (or disable) the row. */
+  revokeAccount(options: RevokeAccountOptions): Promise<RevokeAccountResult>
+  /** Fill uuid/email/organization of unidentified rows from the profile endpoint. */
+  backfillIdentities(): Promise<BackfillEntry[]>
+  /** Non-secret facts about Claude Code's credential file, or null. */
+  readNativeClaudeOAuth(options?: NativeClaudeOptions | null): Promise<NativeClaudeInfo | null>
+  /** Import Claude Code's credential into the store (tokens stay in Rust). */
+  importNativeClaudeAccount(options?: NativeClaudeOptions | null): Promise<ImportResult>
 }
 
 // Convenience functions over a lazily created default `AnthropicAuth()` (the
@@ -279,3 +413,10 @@ export declare function startLogin(options?: StartLoginOptions | null): LoginSta
 export declare function completeLogin(options: CompleteLoginOptions): Promise<AccountInfo>
 export declare function importOAuthAccount(options: ImportOAuthAccountOptions): Promise<ImportResult>
 export declare function handleUnauthorized(options: HandleUnauthorizedOptions): Promise<UnauthorizedResult>
+export declare function exchangeCode(options: ExchangeCodeOptions): Promise<ExchangedAccess>
+export declare function addApiKey(options: AddApiKeyOptions): Promise<AddApiKeyResult>
+export declare function getApiKey(options?: GetApiKeyOptions | null): Promise<ApiKeyCredential>
+export declare function revokeAccount(options: RevokeAccountOptions): Promise<RevokeAccountResult>
+export declare function backfillIdentities(): Promise<BackfillEntry[]>
+export declare function readNativeClaudeOAuth(options?: NativeClaudeOptions | null): Promise<NativeClaudeInfo | null>
+export declare function importNativeClaudeAccount(options?: NativeClaudeOptions | null): Promise<ImportResult>

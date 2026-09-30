@@ -9,7 +9,7 @@
 //!
 //! Errors are thrown as JavaScript `Error`s whose message starts with one of
 //! the codes `auth_required`, `quota_reserve`, `invalid_grant`, `config`,
-//! `transient` (`"<code>: <detail>"`). The package loader (`index.js`)
+//! `invalid_token`, `store_corrupt`, `transient` (`"<code>: <detail>"`). The package loader (`index.js`)
 //! rethrows them as `AnthropicAuthError` with the code on `.code`; napi's
 //! async functions only carry the generic status, so the code travels in the
 //! message.
@@ -32,14 +32,17 @@ use anthropic::keepalive::{
     KeepAliveSkip,
 };
 use anthropic::refresh::{RefreshFailure, SharedRefreshOptions};
+use anthropic::revoke::RevokedRowDisposition;
 use anthropic::{
     Account,
     AccountStore,
     Credential,
     Endpoints,
+    NativePublish,
     OAuthClient,
     OAuthTokens,
     PkceVerifier,
+    RevokeOutcome,
     token,
 };
 use chrono::{DateTime, TimeZone, Utc};
@@ -63,6 +66,10 @@ fn from_crate(error: &anthropic::Error) -> napi::Error {
 
 fn config(message: impl AsRef<str>) -> napi::Error {
     fail(AccessErrorKind::Config, message)
+}
+
+fn invalid_token(message: impl AsRef<str>) -> napi::Error {
+    fail(AccessErrorKind::InvalidToken, message)
 }
 
 fn ms(at: DateTime<Utc>) -> i64 {
@@ -111,6 +118,23 @@ pub struct AuthConfig {
     pub redirect_uri: Option<String>,
     /// OAuth client id.
     pub client_id: Option<String>,
+    /// Refresh-token revocation endpoint (tests point this at a mock).
+    pub revoke_url: Option<String>,
+    /// Profile endpoint used to fill a login's identity.
+    pub profile_url: Option<String>,
+    /// Legacy per-application stores to adopt (`~/.grok`, `~/.config/jfc`,
+    /// …). Default: the crate's list, from the host's `HOME` / `GROK_HOME`,
+    /// when the store is the default one; none for any other store. `[]`
+    /// turns adoption off.
+    pub legacy_paths: Option<Vec<String>>,
+    /// `"auto"` (default) or `"off"`: publish a rotation to Claude Code's
+    /// credential file when it still holds the spent refresh token.
+    /// `ANTHROPIC_NATIVE_PUBLISH=0` also turns it off. In OAuth test mode it
+    /// is off unless `nativeCredentialsPath` names the file.
+    pub native_publish: Option<String>,
+    /// Claude Code's credential file. Default: `$CLAUDE_SECURESTORAGE_CONFIG_DIR`
+    /// / `$CLAUDE_CONFIG_DIR` / `~/.claude`, joined with `.credentials.json`.
+    pub native_credentials_path: Option<String>,
 }
 
 /// Quota reading, as percentages (0–100).
@@ -166,6 +190,8 @@ pub struct AccountInfo {
     pub organization_uuid: Option<String>,
     /// Granted scopes.
     pub scopes: Vec<String>,
+    /// For `api_key` rows: the key's last four characters (never the key).
+    pub api_key_suffix: Option<String>,
 }
 
 fn account_info(store: &AccountStore, account: &Account, now: DateTime<Utc>) -> AccountInfo {
@@ -204,6 +230,10 @@ fn account_info(store: &AccountStore, account: &Account, now: DateTime<Utc>) -> 
             .and_then(|t| t.organization.as_ref())
             .map(|o| o.uuid.clone()),
         scopes: tokens.map(|t| t.scopes.clone()).unwrap_or_default(),
+        api_key_suffix: match &account.credential {
+            Credential::ApiKey { key } => Some(token::key_suffix(key.expose())),
+            Credential::Oauth(_) => None,
+        },
     }
 }
 
@@ -334,6 +364,12 @@ pub struct StartLoginOptions {
     pub mode: Option<String>,
     /// Pre-fill the login email.
     pub login_hint: Option<String>,
+    /// Redirect URI for this login only (a loopback listener's), used for
+    /// the authorize URL and the code exchange alike.
+    pub redirect_uri: Option<String>,
+    /// Anti-CSRF state for this login (one a loopback listener already
+    /// expects): 8-512 URL-safe characters. Default: a fresh random one.
+    pub state: Option<String>,
 }
 
 /// A login in progress. The PKCE verifier stays in Rust.
@@ -416,6 +452,140 @@ pub struct UnauthorizedResult {
     pub failure_code: Option<String>,
 }
 
+/// Options for [`AnthropicAuth::add_api_key`].
+#[napi(object)]
+pub struct AddApiKeyOptions {
+    /// Label (and preferred id).
+    pub label: Option<String>,
+    /// The `sk-ant-api…` key. Moves into the store; it is only ever handed
+    /// back by `getApiKey`.
+    pub key: String,
+}
+
+/// Result of [`AnthropicAuth::add_api_key`].
+#[napi(object)]
+pub struct AddApiKeyResult {
+    /// The row holding the key.
+    pub account_id: String,
+    /// `"added"` or `"already_present"` (a row already holds this key).
+    pub status: String,
+}
+
+/// Options for [`AnthropicAuth::get_api_key`].
+#[napi(object)]
+#[derive(Default)]
+pub struct GetApiKeyOptions {
+    /// Use only this account (id or label).
+    pub account: Option<String>,
+    /// Consider only these accounts (ids or labels).
+    pub allowlist: Option<Vec<String>>,
+}
+
+/// A static API key from the store. Send it as `x-api-key`; never log it.
+#[napi(object)]
+pub struct ApiKeyCredential {
+    /// The key.
+    pub api_key: String,
+    /// Store row it belongs to.
+    pub account_id: String,
+    /// The row's label.
+    pub label: Option<String>,
+}
+
+/// Options for [`AnthropicAuth::revoke_account`].
+#[napi(object)]
+pub struct RevokeAccountOptions {
+    /// Store row.
+    pub account_id: String,
+    /// Keep the row, disabled with its token recorded dead, instead of
+    /// removing it.
+    pub disable: Option<bool>,
+}
+
+/// Result of [`AnthropicAuth::revoke_account`].
+#[napi(object)]
+pub struct RevokeAccountResult {
+    /// Store row.
+    pub account_id: String,
+    /// `"revoked"`, `"already_inactive"`, or `"not_sent"` (the token was
+    /// already recorded dead, so no request was needed).
+    pub outcome: String,
+    /// Whether the row was removed (else it was disabled).
+    pub removed: bool,
+}
+
+/// Options for [`AnthropicAuth::exchange_code`].
+#[napi(object)]
+pub struct ExchangeCodeOptions {
+    /// From `startLogin`.
+    pub login_id: String,
+    /// What the user pasted or the loopback received (as for `completeLogin`).
+    pub callback: String,
+}
+
+/// A code exchanged without storing anything (the Console API-key mint).
+/// The refresh token of the grant is dropped in Rust.
+#[napi(object)]
+pub struct ExchangedAccess {
+    /// Bearer for the one follow-up call.
+    pub access_token: String,
+    /// Access-token expiry (epoch ms).
+    pub expires_at: i64,
+    /// Granted scopes.
+    pub scopes: Vec<String>,
+    /// Anthropic account uuid, when the grant carried one.
+    pub account_uuid: Option<String>,
+    /// Account email, when the grant carried one.
+    pub email: Option<String>,
+    /// Organization uuid, when the grant carried one.
+    pub organization_uuid: Option<String>,
+}
+
+/// One row of [`AnthropicAuth::backfill_identities`].
+#[napi(object)]
+pub struct BackfillEntry {
+    /// Store row.
+    pub account_id: String,
+    /// `"filled"`, `"not_oauth"`, `"already_identified"`,
+    /// `"profile_unavailable"`, `"no_live_access_token"` or `"changed"`.
+    pub status: String,
+    /// The email written, for `"filled"`.
+    pub email: Option<String>,
+}
+
+/// Options for [`AnthropicAuth::read_native_claude_oauth`] and
+/// [`AnthropicAuth::import_native_claude_account`].
+#[napi(object)]
+#[derive(Default)]
+pub struct NativeClaudeOptions {
+    /// Claude Code's credential file (default: the handle's
+    /// `nativeCredentialsPath`, else Claude Code's own path; in OAuth test
+    /// mode only an explicit path is read).
+    pub path: Option<String>,
+    /// Label for an imported row (default `"Claude Code"`).
+    pub label: Option<String>,
+}
+
+/// Non-secret facts about Claude Code's credential file.
+#[napi(object)]
+pub struct NativeClaudeInfo {
+    /// The file read.
+    pub path: String,
+    /// Access-token expiry (epoch ms).
+    pub expires_at: i64,
+    /// Refresh-token expiry (epoch ms), when recorded.
+    pub refresh_expires_at: Option<i64>,
+    /// Granted scopes.
+    pub scopes: Vec<String>,
+    /// `subscriptionType`.
+    pub subscription_type: Option<String>,
+    /// `rateLimitTier`.
+    pub rate_limit_tier: Option<String>,
+    /// The store row holding the same refresh token, when there is one
+    /// (then a store refresh is published back to this file).
+    pub store_account_id: Option<String>,
+}
+
 struct PendingLogin {
     verifier: PkceVerifier,
     state: String,
@@ -431,13 +601,78 @@ pub struct AnthropicAuth {
     path: PathBuf,
     endpoints: Endpoints,
     console_authorize_url: String,
+    profile_url: String,
     test_mode: bool,
+    legacy: Vec<PathBuf>,
+    native_publish: NativePublish,
+    native_path: Option<PathBuf>,
     logins: Arc<Mutex<HashMap<String, PendingLogin>>>,
 }
 
 impl AnthropicAuth {
     fn client(&self) -> OAuthClient {
         OAuthClient::new(self.endpoints.clone()).require_loopback(self.test_mode)
+    }
+
+    fn refresh_options(&self) -> SharedRefreshOptions {
+        SharedRefreshOptions {
+            native_publish: self.native_publish.clone(),
+            ..SharedRefreshOptions::default()
+        }
+    }
+
+    /// Fold the configured legacy stores into the store (append-only,
+    /// locked; a no-op once every file is recorded in `migrated_from`).
+    async fn adopt_legacy(&self) -> napi::Result<()> {
+        if self.legacy.is_empty() {
+            return Ok(());
+        }
+        let (path, legacy) = (self.path.clone(), self.legacy.clone());
+        blocking(move || {
+            AccountStore::adopt_legacy(&path, &legacy)
+                .map(|_| ())
+                .map_err(|e| from_crate(&e))
+        })
+        .await
+    }
+
+    /// Claude Code's credential file for an explicit read/import: `explicit`,
+    /// else the handle's configured one; `None` in OAuth test mode without
+    /// an explicit path (a test never reads the real file).
+    fn native_file(&self, explicit: Option<String>) -> Option<PathBuf> {
+        match explicit
+            .map(|p| p.trim().to_owned())
+            .filter(|p| !p.is_empty())
+        {
+            Some(path) => Some(PathBuf::from(path)),
+            None => self.native_path.clone(),
+        }
+    }
+
+    /// Fill an unidentified grant from the profile endpoint (best effort:
+    /// a failure, or test mode refusing the host, leaves it as it is).
+    async fn identify(&self, mut tokens: OAuthTokens) -> OAuthTokens {
+        if tokens.account.as_ref().is_some_and(|a| !a.uuid.is_empty())
+            || anthropic::endpoints::check_oauth_url(&self.profile_url, self.test_mode()).is_err()
+        {
+            return tokens;
+        }
+        let identity = anthropic::profile::fetch_oauth_account_identity_from(
+            &anthropic::oauth::default_oauth_http_client(),
+            &self.profile_url,
+            tokens.access.expose(),
+        )
+        .await;
+        if let Some(uuid) = identity.account_uuid {
+            tokens.account = Some(token::TokenAccount {
+                uuid,
+                email_address: identity.email,
+            });
+            if let Some(org) = identity.organization_uuid {
+                tokens.organization = Some(token::TokenOrganization { uuid: org });
+            }
+        }
+        tokens
     }
 }
 
@@ -490,10 +725,11 @@ impl AnthropicAuth {
     ) -> napi::Result<Self> {
         let cfg = options.unwrap_or_default();
         let host = HostEnv(env.unwrap_or_default());
+        let default_path = host.store_path();
         let path = match cfg.store_path.as_deref().map(str::trim) {
             Some("") => return Err(config_error("storePath is empty")),
             Some(path) => PathBuf::from(path),
-            None => host.store_path(),
+            None => default_path.clone(),
         };
         // The crate's one endpoint resolver (ANTHROPIC_OAUTH_*_URL,
         // CLAUDE_CODE_OAUTH_CLIENT_ID, ANTHROPIC_BASE_URL) over the host's
@@ -501,16 +737,19 @@ impl AnthropicAuth {
         let mut endpoints = Endpoints::from_lookup(|key| host.get(key));
         let mut console_authorize_url =
             Endpoints::console_from_lookup(|key| host.get(key)).authorize_url;
+        let mut profile_url = anthropic::profile::profile_url_from_lookup(|key| host.get(key));
         let test_mode = anthropic::endpoints::oauth_test_mode_value(
             host.get(anthropic::endpoints::OAUTH_TEST_MODE_ENV)
                 .as_deref(),
-        );
+        ) || anthropic::endpoints::oauth_test_mode();
         for (value, slot) in [
             (cfg.token_url, &mut endpoints.token_url),
             (cfg.authorize_url, &mut endpoints.authorize_url),
             (cfg.console_authorize_url, &mut console_authorize_url),
             (cfg.redirect_uri, &mut endpoints.redirect_uri),
             (cfg.client_id, &mut endpoints.client_id),
+            (cfg.revoke_url, &mut endpoints.revoke_url),
+            (cfg.profile_url, &mut profile_url),
         ] {
             if let Some(value) = value {
                 let value = value.trim().to_owned();
@@ -523,15 +762,62 @@ impl AnthropicAuth {
         for url in [
             &endpoints.token_url,
             &endpoints.authorize_url,
+            &endpoints.revoke_url,
             &console_authorize_url,
+            &profile_url,
         ] {
             url::Url::parse(url).map_err(|e| config(format!("invalid endpoint url: {e}")))?;
         }
+        // Legacy adoption is a machine-level migration into the default
+        // store (the crate's and ckl's rule); any other store adopts only
+        // what the caller lists.
+        let legacy = match cfg.legacy_paths {
+            Some(paths) => paths
+                .into_iter()
+                .map(|p| p.trim().to_owned())
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from)
+                .collect(),
+            None if path == default_path => {
+                anthropic::store::legacy_store_paths_from_lookup(|key| host.get(key))
+            }
+            None => Vec::new(),
+        };
+        let explicit_native = cfg
+            .native_credentials_path
+            .map(|p| p.trim().to_owned())
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from);
+        // Test mode never resolves Claude Code's real file: only an explicit
+        // path is read or written.
+        let native_path = explicit_native.clone().or_else(|| {
+            (!test_mode)
+                .then(|| anthropic::native_claude_credentials_path_from_lookup(|key| host.get(key)))
+        });
+        let publish_on = match cfg.native_publish.as_deref().map(str::trim) {
+            None | Some("auto") => {
+                NativePublish::from_lookup(|key| host.get(key)) == NativePublish::Auto
+            }
+            Some("off") => false,
+            Some(other) => {
+                return Err(config(format!(
+                    "nativePublish must be \"auto\" or \"off\", not {other:?}"
+                )));
+            }
+        };
+        let native_publish = match (&native_path, publish_on) {
+            (Some(file), true) => NativePublish::At(file.clone()),
+            _ => NativePublish::Off,
+        };
         Ok(Self {
             path,
             endpoints,
             console_authorize_url,
+            profile_url,
             test_mode,
+            legacy,
+            native_publish,
+            native_path,
             logins: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -552,6 +838,7 @@ impl AnthropicAuth {
     /// Every row, non-secret fields only.
     #[napi]
     pub async fn list_accounts(&self) -> napi::Result<Vec<AccountInfo>> {
+        self.adopt_legacy().await?;
         let path = self.path.clone();
         blocking(move || {
             let store = AccountStore::load_or_migrate_from(&path, &[])
@@ -576,6 +863,7 @@ impl AnthropicAuth {
         options: Option<GetAccessTokenOptions>,
     ) -> napi::Result<AccessToken> {
         let options = options.unwrap_or_default();
+        self.adopt_legacy().await?;
         let request = AccessRequest {
             account: options.account,
             allowlist: options.allowlist.unwrap_or_default(),
@@ -585,7 +873,7 @@ impl AnthropicAuth {
             &self.client(),
             &self.path,
             &request,
-            &SharedRefreshOptions::default(),
+            &self.refresh_options(),
         )
         .await
         .map(access_token_of)
@@ -766,7 +1054,10 @@ impl AnthropicAuth {
         options: Option<KeepAliveOnceOptions>,
     ) -> napi::Result<KeepAliveResult> {
         let options = options.unwrap_or_default();
-        let mut keepalive = KeepAliveOptions::default();
+        let mut keepalive = KeepAliveOptions {
+            refresh: self.refresh_options(),
+            ..KeepAliveOptions::default()
+        };
         if let Some(days) = options.threshold_days {
             if !(days.is_finite() && days > 0.0) {
                 return Err(config("thresholdDays must be a positive number"));
@@ -835,7 +1126,20 @@ impl AnthropicAuth {
             Some("console") => endpoints.authorize_url = self.console_authorize_url.clone(),
             Some(other) => return Err(config(format!("unknown login mode {other:?}"))),
         }
-        let login = anthropic::start_login(&endpoints).map_err(|e| from_crate(&e))?;
+        if let Some(redirect) = options
+            .redirect_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+        {
+            url::Url::parse(redirect).map_err(|e| config(format!("invalid redirectUri: {e}")))?;
+            endpoints.redirect_uri = redirect.to_owned();
+        }
+        let login = match options.state {
+            Some(state) => anthropic::start_login_with_state(&endpoints, state),
+            None => anthropic::start_login(&endpoints),
+        }
+        .map_err(|e| from_crate(&e))?;
         let mut url = login.authorize_url;
         if let Some(hint) = options
             .login_hint
@@ -871,26 +1175,10 @@ impl AnthropicAuth {
     /// account (updating the same login in place when it already exists).
     #[napi]
     pub async fn complete_login(&self, options: CompleteLoginOptions) -> napi::Result<AccountInfo> {
-        let pending = self
-            .logins
-            .lock()
-            .map_err(|_| fail(AccessErrorKind::Transient, "login table poisoned"))?
-            .remove(&options.login_id)
-            .filter(|p| p.started.elapsed() < LOGIN_TTL)
-            .ok_or_else(|| {
-                fail(
-                    AccessErrorKind::AuthRequired,
-                    "unknown or expired login; start a new one",
-                )
-            })?;
-        let (code, state) = parse_callback(&options.callback, &pending.state)?;
-        let code = anthropic::parse_redirect_code(&format!("{code}#{state}"), &pending.state)
-            .map_err(|e| from_crate(&e))?;
-        let client = OAuthClient::new(pending.endpoints).require_loopback(self.test_mode);
-        let tokens = client
-            .exchange_code(&code, &pending.verifier, &pending.state)
-            .await
-            .map_err(|e| from_crate(&e))?;
+        let tokens = self.exchange(&options.login_id, &options.callback).await?;
+        // Name the row after the signed-in account and let a re-login find
+        // the row it supersedes, when the grant itself carried no identity.
+        let tokens = self.identify(tokens).await;
         let label = options
             .label
             .map(|l| l.trim().to_owned())
@@ -911,7 +1199,7 @@ impl AnthropicAuth {
         if !token::is_valid_access_token(&options.access_token)
             || !token::is_valid_refresh_token(&options.refresh_token)
         {
-            return Err(config(
+            return Err(invalid_token(
                 "importOAuthAccount needs a well-formed access and refresh token",
             ));
         }
@@ -932,47 +1220,252 @@ impl AnthropicAuth {
                 .organization_uuid
                 .map(|uuid| token::TokenOrganization { uuid }),
         };
-        let label = options.label.filter(|l| !l.trim().is_empty());
-        let email = options.email;
+        let tokens = if tokens.expires_at > Utc::now() {
+            self.identify(tokens).await
+        } else {
+            tokens
+        };
+        self.import_tokens(tokens, options.label, options.email)
+            .await
+    }
+
+    /// Exchange a login's code **without storing anything**: for the Console
+    /// "create an API key" flow, whose grant is used once to mint a key. The
+    /// grant's refresh token is dropped in Rust; only the access token and
+    /// non-secret metadata are returned.
+    #[napi]
+    pub async fn exchange_code(
+        &self,
+        options: ExchangeCodeOptions,
+    ) -> napi::Result<ExchangedAccess> {
+        let tokens = self.exchange(&options.login_id, &options.callback).await?;
+        Ok(ExchangedAccess {
+            access_token: tokens.access.expose().to_owned(),
+            expires_at: ms(tokens.expires_at),
+            scopes: tokens.scopes.clone(),
+            account_uuid: tokens.account.as_ref().map(|a| a.uuid.clone()),
+            email: tokens
+                .account
+                .as_ref()
+                .and_then(|a| a.email_address.clone()),
+            organization_uuid: tokens.organization.as_ref().map(|o| o.uuid.clone()),
+        })
+    }
+
+    /// Store a static API key as an `api_key` row. The key is validated
+    /// (`sk-ant-api…`); `listAccounts` shows only its last four characters.
+    #[napi]
+    pub async fn add_api_key(&self, options: AddApiKeyOptions) -> napi::Result<AddApiKeyResult> {
+        let key = options.key.trim().to_owned();
+        if !token::is_valid_api_key(&key) {
+            return Err(invalid_token(
+                "addApiKey needs a well-formed Anthropic API key",
+            ));
+        }
+        let label = options.label;
         let path = self.path.clone();
         blocking(move || {
-            let status = AccountStore::mutate(&path, |store| {
-                if let Some(existing) = store.find_by_refresh_token(&tokens.refresh) {
-                    return Ok(("already_present", existing.id.clone()));
-                }
-                let mut candidate = Account::new(
-                    preferred_id(store, &tokens, label.as_deref()),
-                    Credential::Oauth(tokens.clone()),
-                );
-                candidate.label = label.clone();
-                if email.is_some() {
-                    candidate.email = email.clone();
-                }
-                let incoming: std::collections::HashSet<String> =
-                    anthropic::account_identities(&candidate)
-                        .into_iter()
-                        .collect();
-                if let Some(existing) = store.accounts.iter().find(|a| {
-                    anthropic::account_identities(a)
-                        .iter()
-                        .any(|k| incoming.contains(k))
-                }) {
-                    return Ok(("kept", existing.id.clone()));
-                }
-                let id = candidate.id.clone();
-                store.accounts.push(candidate);
-                if store.current.is_none() {
-                    store.current = Some(id.clone());
-                }
-                Ok(("added", id))
+            let (account_id, added) = AccountStore::mutate(&path, |store| {
+                Ok(store.add_api_key(label.as_deref(), token::ApiKey::new(key)))
             })
             .map_err(|e| from_crate(&e))?;
-            Ok(ImportResult {
-                account_id: status.1,
-                status: status.0.into(),
+            Ok(AddApiKeyResult {
+                account_id,
+                status: if added { "added" } else { "already_present" }.into(),
             })
         })
         .await
+    }
+
+    /// A static API key from an `api_key` row (id or label, pin first,
+    /// enabled and not cooling down). Send it as `x-api-key`; never log it.
+    #[napi]
+    pub async fn get_api_key(
+        &self,
+        options: Option<GetApiKeyOptions>,
+    ) -> napi::Result<ApiKeyCredential> {
+        let options = options.unwrap_or_default();
+        self.adopt_legacy().await?;
+        let path = self.path.clone();
+        blocking(move || {
+            let request = AccessRequest {
+                account: options.account,
+                allowlist: options.allowlist.unwrap_or_default(),
+                reserve_percent: None,
+            };
+            anthropic::access::get_api_key(&path, &request)
+                .map(|grant| ApiKeyCredential {
+                    api_key: grant.api_key,
+                    account_id: grant.account_id,
+                    label: grant.label,
+                })
+                .map_err(|e| fail(e.kind, e.message))
+        })
+        .await
+    }
+
+    /// Revoke an OAuth account's refresh token at the revoke endpoint, then
+    /// remove the row (or, with `disable`, keep it disabled with the token
+    /// recorded dead). A failed request changes nothing.
+    #[napi]
+    pub async fn revoke_account(
+        &self,
+        options: RevokeAccountOptions,
+    ) -> napi::Result<RevokeAccountResult> {
+        let disposition = if options.disable.unwrap_or(false) {
+            RevokedRowDisposition::Disable
+        } else {
+            RevokedRowDisposition::Remove
+        };
+        let report = self
+            .client()
+            .revoke_account(
+                &self.path,
+                &options.account_id,
+                disposition,
+                &self.refresh_options(),
+            )
+            .await
+            .map_err(|e| from_crate(&e))?;
+        Ok(RevokeAccountResult {
+            account_id: report.account_id,
+            outcome: match report.outcome {
+                Some(RevokeOutcome::Revoked) => "revoked",
+                Some(RevokeOutcome::AlreadyInactive) => "already_inactive",
+                None => "not_sent",
+            }
+            .into(),
+            removed: report.removed,
+        })
+    }
+
+    /// Fill the identity (account uuid, email, organization) of OAuth rows
+    /// that have none, from the profile endpoint with each row's live access
+    /// token. Never spends a refresh token.
+    #[napi]
+    pub async fn backfill_identities(&self) -> napi::Result<Vec<BackfillEntry>> {
+        let report = anthropic::profile::backfill_store_identities(
+            &anthropic::oauth::default_oauth_http_client(),
+            &self.profile_url,
+            &self.path,
+            self.test_mode(),
+        )
+        .await
+        .map_err(|e| from_crate(&e))?;
+        use anthropic::profile::{BackfillSkip, IdentityBackfill};
+        Ok(report
+            .into_iter()
+            .map(|(account_id, result)| {
+                let (status, email) = match result {
+                    IdentityBackfill::Filled { email } => ("filled", email),
+                    IdentityBackfill::Skipped(BackfillSkip::NotOauth) => ("not_oauth", None),
+                    IdentityBackfill::Skipped(BackfillSkip::AlreadyIdentified) => {
+                        ("already_identified", None)
+                    }
+                    IdentityBackfill::Skipped(BackfillSkip::ProfileUnavailable) => {
+                        ("profile_unavailable", None)
+                    }
+                    IdentityBackfill::NoLiveAccessToken => ("no_live_access_token", None),
+                    IdentityBackfill::Changed => ("changed", None),
+                };
+                BackfillEntry {
+                    account_id,
+                    status: status.into(),
+                    email,
+                }
+            })
+            .collect())
+    }
+
+    /// Non-secret facts about the credential Claude Code holds in its
+    /// credential file, or `null` when there is none (or, in OAuth test
+    /// mode, when no path is given). Unusable files (symlink, group/world
+    /// readable, malformed) reject.
+    #[napi(js_name = "readNativeClaudeOAuth")]
+    pub async fn read_native_claude_oauth(
+        &self,
+        options: Option<NativeClaudeOptions>,
+    ) -> napi::Result<Option<NativeClaudeInfo>> {
+        let Some(file) = self.native_file(options.unwrap_or_default().path) else {
+            return Ok(None);
+        };
+        let path = self.path.clone();
+        blocking(move || {
+            let Some(summary) =
+                anthropic::read_native_claude_summary(Some(&file)).map_err(|e| native_error(&e))?
+            else {
+                return Ok(None);
+            };
+            let store_account_id = AccountStore::load_or_migrate_from(&path, &[])
+                .ok()
+                .and_then(|loaded| {
+                    loaded
+                        .store
+                        .accounts
+                        .iter()
+                        .find(|a| {
+                            a.oauth().is_some_and(|t| {
+                                token::token_fingerprint(t.refresh.expose())
+                                    == summary.refresh_fingerprint
+                            })
+                        })
+                        .map(|a| a.id.clone())
+                });
+            Ok(Some(NativeClaudeInfo {
+                path: summary.path.to_string_lossy().into_owned(),
+                expires_at: summary.expires_at,
+                refresh_expires_at: summary.refresh_expires_at,
+                scopes: summary.scopes,
+                subscription_type: summary.subscription_type,
+                rate_limit_tier: summary.rate_limit_tier,
+                store_account_id,
+            }))
+        })
+        .await
+    }
+
+    /// Import the credential Claude Code holds in its credential file into
+    /// the store (the tokens never reach JavaScript). The store's copy of the
+    /// same login wins. From then on a store refresh of that token is
+    /// published back to the file, so Claude Code's login stays alive.
+    /// Rejects `auth_required` when there is no file (or, in OAuth test
+    /// mode, no explicit path).
+    #[napi]
+    pub async fn import_native_claude_account(
+        &self,
+        options: Option<NativeClaudeOptions>,
+    ) -> napi::Result<ImportResult> {
+        let options = options.unwrap_or_default();
+        let Some(file) = self.native_file(options.path) else {
+            return Err(fail(
+                AccessErrorKind::AuthRequired,
+                "no Claude Code credential file to import (OAuth test mode reads only an explicit path)",
+            ));
+        };
+        let imported = blocking(move || {
+            match std::fs::symlink_metadata(&file) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(fail(
+                        AccessErrorKind::AuthRequired,
+                        "Claude Code has no credential file here",
+                    ));
+                }
+                _ => {}
+            }
+            anthropic::import_native_claude_file(Some(&file)).map_err(|e| native_error(&e))
+        })
+        .await?;
+        let tokens = if imported.tokens.expires_at > Utc::now() {
+            self.identify(imported.tokens).await
+        } else {
+            imported.tokens
+        };
+        let label = options
+            .label
+            .map(|l| l.trim().to_owned())
+            .filter(|l| !l.is_empty())
+            .or_else(|| Some("Claude Code".to_owned()));
+        self.import_tokens(tokens, label, None).await
     }
 
     /// Recover from an upstream 401 on a store credential: one claimed
@@ -985,11 +1478,7 @@ impl AnthropicAuth {
     ) -> napi::Result<UnauthorizedResult> {
         let recovery = self
             .client()
-            .recover_unauthorized(
-                &self.path,
-                &options.access_token,
-                &SharedRefreshOptions::default(),
-            )
+            .recover_unauthorized(&self.path, &options.access_token, &self.refresh_options())
             .await
             .map_err(|e| from_crate(&e))?;
         let path = self.path.clone();
@@ -1033,6 +1522,82 @@ impl AnthropicAuth {
 }
 
 impl AnthropicAuth {
+    /// Take a pending login, verify the callback's state and exchange the
+    /// code. Nothing is stored.
+    async fn exchange(&self, login_id: &str, callback: &str) -> napi::Result<OAuthTokens> {
+        let pending = self
+            .logins
+            .lock()
+            .map_err(|_| fail(AccessErrorKind::Transient, "login table poisoned"))?
+            .remove(login_id)
+            .filter(|p| p.started.elapsed() < LOGIN_TTL)
+            .ok_or_else(|| {
+                fail(
+                    AccessErrorKind::AuthRequired,
+                    "unknown or expired login; start a new one",
+                )
+            })?;
+        let (code, state) = parse_callback(callback, &pending.state)?;
+        let code = anthropic::parse_redirect_code(&format!("{code}#{state}"), &pending.state)
+            .map_err(|e| from_crate(&e))?;
+        OAuthClient::new(pending.endpoints)
+            .require_loopback(self.test_mode)
+            .exchange_code(&code, &pending.verifier, &pending.state)
+            .await
+            .map_err(|e| from_crate(&e))
+    }
+
+    /// Store an imported OAuth credential: the store is the custodian, so a
+    /// row that already holds this token or this login wins.
+    async fn import_tokens(
+        &self,
+        tokens: OAuthTokens,
+        label: Option<String>,
+        email: Option<String>,
+    ) -> napi::Result<ImportResult> {
+        let label = label.filter(|l| !l.trim().is_empty());
+        let email = email.or_else(|| tokens.account.as_ref()?.email_address.clone());
+        let path = self.path.clone();
+        blocking(move || {
+            let status = AccountStore::mutate(&path, |store| {
+                if let Some(existing) = store.find_by_refresh_token(&tokens.refresh) {
+                    return Ok(("already_present", existing.id.clone()));
+                }
+                let mut candidate = Account::new(
+                    preferred_id(store, &tokens, label.as_deref()),
+                    Credential::Oauth(tokens.clone()),
+                );
+                candidate.label = label.clone();
+                if email.is_some() {
+                    candidate.email = email.clone();
+                }
+                let incoming: std::collections::HashSet<String> =
+                    anthropic::account_identities(&candidate)
+                        .into_iter()
+                        .collect();
+                if let Some(existing) = store.accounts.iter().find(|a| {
+                    anthropic::account_identities(a)
+                        .iter()
+                        .any(|k| incoming.contains(k))
+                }) {
+                    return Ok(("kept", existing.id.clone()));
+                }
+                let id = candidate.id.clone();
+                store.accounts.push(candidate);
+                if store.current.is_none() {
+                    store.current = Some(id.clone());
+                }
+                Ok(("added", id))
+            })
+            .map_err(|e| from_crate(&e))?;
+            Ok(ImportResult {
+                account_id: status.1,
+                status: status.0.into(),
+            })
+        })
+        .await
+    }
+
     async fn update_row(
         &self,
         account_id: String,
@@ -1055,6 +1620,22 @@ impl AnthropicAuth {
 
 fn config_error(message: &str) -> napi::Error {
     config(message)
+}
+
+/// A native credential file that exists but cannot be used: malformed
+/// tokens are `invalid_token`, everything else about the file is
+/// `store_corrupt` (symlink, permissions, JSON) or the crate's class.
+fn native_error(error: &anthropic::Error) -> napi::Error {
+    match error {
+        anthropic::Error::MalformedTokenResponse(_) => invalid_token(format!(
+            "Claude Code's credential file holds no usable OAuth token: {error}"
+        )),
+        anthropic::Error::Protocol(_) => fail(
+            AccessErrorKind::StoreCorrupt,
+            format!("Claude Code's credential file is unusable: {error}"),
+        ),
+        other => from_crate(other),
+    }
 }
 
 fn reason_code(reason: KeepAliveReason) -> &'static str {

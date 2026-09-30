@@ -22,6 +22,7 @@ Object.assign(process.env, {
   ANTHROPIC_OAUTH_CONSOLE_AUTHORIZE_URL: `${DEAD_LOOPBACK}/oauth/authorize`,
   ANTHROPIC_OAUTH_REDIRECT_URI: `${DEAD_LOOPBACK}/oauth/code/callback`,
   ANTHROPIC_OAUTH_USAGE_URL: `${DEAD_LOOPBACK}/api/oauth/usage`,
+  ANTHROPIC_OAUTH_PROFILE_URL: `${DEAD_LOOPBACK}/api/oauth/profile`,
   ANTHROPIC_BASE_URL: DEAD_LOOPBACK,
   HOME: home,
   ANTHROPIC_ACCOUNTS_FILE: join(home, 'accounts.json'),

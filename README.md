@@ -77,6 +77,22 @@ Store safety properties, each covered by a test:
   days) or that have no access token, behind a store-level lease. Nothing else
   rotates idle accounts.
 
+- **Claude Code's login is kept alive** — after a rotation it committed,
+  `refresh_shared` publishes the new token pair to Claude Code's
+  `.credentials.json` when (and only when) that file still holds the spent
+  refresh token: never created, never through a symlink, never over an
+  unparseable file, unknown keys kept, `0600` + rename, under Claude Code's
+  own `.storage-write.lock`. `SharedRefreshOptions::native_publish`
+  (`NativePublish::{Off, Auto, At(path)}`); default `Auto` unless
+  `ANTHROPIC_NATIVE_PUBLISH=0`; `Auto` is suppressed in OAuth test mode.
+- **Revoke is claimed** — `OAuthClient::revoke_account` claims the row,
+  revokes the refresh token, and only then removes or disables the row.
+- **API-key rows** — `AccountStore::add_api_key` / `access::get_api_key`.
+- **Legacy adoption persists** — `AccountStore::adopt_legacy` (append-only,
+  `migrated_from`-guarded; dead rows skipped).
+- **Identity backfill** — `profile::backfill_store_identities` fills
+  unidentified rows from the profile endpoint with a live access token only.
+
 `access::get_access_token` is the coarse entry point for hosts: selection
 (pin first, allowlist, quota reserve), refresh, adoption and rotation past a
 failing login, returning an access token and non-secret metadata only.

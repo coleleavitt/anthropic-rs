@@ -336,7 +336,7 @@ describe('login and import', () => {
     )
     await expectCode(
       a.importOAuthAccount({ accessToken: 'x', refreshToken: 'y', expiresAt: 0 }),
-      'config',
+      'invalid_token',
     )
   })
 })

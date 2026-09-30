@@ -13,6 +13,8 @@ const CODES = new Set([
   'quota_reserve',
   'invalid_grant',
   'config',
+  'invalid_token',
+  'store_corrupt',
   'transient',
 ])
 
@@ -65,11 +67,17 @@ const ENV_KEYS = [
   'ANTHROPIC_OAUTH_CONSOLE_AUTHORIZE_URL',
   'ANTHROPIC_OAUTH_REDIRECT_URI',
   'ANTHROPIC_OAUTH_USAGE_URL',
+  'ANTHROPIC_OAUTH_PROFILE_URL',
   'CLAUDE_CODE_OAUTH_CLIENT_ID',
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_ACCOUNTS_FILE',
   'ANTHROPIC_ACCOUNTS_DIR',
+  'ANTHROPIC_NATIVE_PUBLISH',
+  'CLAUDE_CONFIG_DIR',
+  'CLAUDE_SECURESTORAGE_CONFIG_DIR',
+  'GROK_HOME',
   'HOME',
+  'USERPROFILE',
 ]
 
 function envSnapshot() {
@@ -147,4 +155,12 @@ module.exports = {
   completeLogin: (...args) => defaultAuth().completeLogin(...args),
   importOAuthAccount: (...args) => defaultAuth().importOAuthAccount(...args),
   handleUnauthorized: (...args) => defaultAuth().handleUnauthorized(...args),
+  exchangeCode: (...args) => defaultAuth().exchangeCode(...args),
+  addApiKey: (...args) => defaultAuth().addApiKey(...args),
+  getApiKey: (...args) => defaultAuth().getApiKey(...args),
+  revokeAccount: (...args) => defaultAuth().revokeAccount(...args),
+  backfillIdentities: (...args) => defaultAuth().backfillIdentities(...args),
+  readNativeClaudeOAuth: (...args) => defaultAuth().readNativeClaudeOAuth(...args),
+  importNativeClaudeAccount: (...args) =>
+    defaultAuth().importNativeClaudeAccount(...args),
 }
