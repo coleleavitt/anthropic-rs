@@ -9,23 +9,33 @@
 //! path that spends a refresh token for a shared credential and it
 //! serializes, remembers, and persists accordingly:
 //!
-//! 1. The store is loaded. If it cannot be read the refresh is **refused**:
-//!    without the store there is no way to prove the token is not being
-//!    spent elsewhere.
-//! 2. If the presented token is not in the store, a live peer-rotated
-//!    `current` credential is adopted instead of spending anything.
-//! 3. Otherwise the caller claims the account's refresh lease (bounded,
-//!    jittered retries). `already-refreshed` adopts the peer's rotation;
-//!    `dead-token` refuses; a claim that never comes through refuses — the
-//!    token is never presented on an uncertain claim.
+//! 1. The store is read **under its lock**. If it cannot be read the refresh
+//!    is **refused**: without the store there is no way to prove the token is
+//!    not being spent elsewhere.
+//! 2. Only a refresh token the store holds right now is ever spent. When the
+//!    presented token is not in the store:
+//!    - a row holding the same login (account uuid + organization) means a
+//!      peer rotated it: its live session is adopted, or, when that session
+//!      has expired too, *the store's* token is refreshed instead of the
+//!      caller's stale one;
+//!    - otherwise a live peer-rotated `current` credential is adopted;
+//!    - otherwise the refresh is refused. A bare refresh of a token the store
+//!      has never held needs [`SharedRefreshOptions::allow_unshared`].
+//! 3. The caller claims the account's refresh lease (bounded, jittered
+//!    retries). `already-refreshed` adopts the peer's rotation; `dead-token`
+//!    refuses; a claim that never comes through refuses — the token is never
+//!    presented on an uncertain claim.
 //! 4. A process-local dead set short-circuits a token the store cannot
 //!    remember (a credential the store has never seen).
-//! 5. The token endpoint is called once. `invalid_grant` records the
-//!    fingerprint as dead (locally and, when known, durably) before the error
-//!    is returned.
-//! 6. The rotation is committed with compare-and-swap on the presented
-//!    token; a lost race adopts the winner's session when it is usable and
-//!    refuses otherwise. The lease is released on every path.
+//! 5. The token endpoint is called once, bounded by a deadline shorter than
+//!    the claim ([`refresh_deadline`]). Only HTTP 400 `invalid_grant` records
+//!    the fingerprint as dead (locally, and durably when the store still
+//!    holds that token); every other failure is transient and is noted
+//!    against the token without marking it.
+//! 6. The rotation is committed with compare-and-swap on the presented token
+//!    and the still-live claim; a result obtained under a lapsed claim is
+//!    discarded. A lost race adopts the winner's session when it is usable
+//!    and refuses otherwise. The lease is released on every path.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -76,9 +86,14 @@ pub struct SharedRefreshOptions {
     /// Base wait between claim attempts, in milliseconds; a random 0–100%
     /// extra is added.
     pub claim_wait_ms: u64,
-    /// Lease TTL for the claim. The token-endpoint call must complete inside
-    /// it; the crate's HTTP timeout must be shorter.
+    /// Lease TTL for the claim. The token-endpoint call is cut off at
+    /// [`refresh_deadline`] of this, so it always ends inside the claim.
     pub lease_ttl_secs: i64,
+    /// Permit a bare refresh of a token the store has never held (no row
+    /// holds it and no row holds the same login). Off by default: such a
+    /// token may be one a peer just rotated, and spending it revokes the
+    /// family. Only the process-local dead set guards it.
+    pub allow_unshared: bool,
 }
 
 impl Default for SharedRefreshOptions {
@@ -87,8 +102,18 @@ impl Default for SharedRefreshOptions {
             claim_max_attempts: REFRESH_CLAIM_MAX_ATTEMPTS,
             claim_wait_ms: 1_000,
             lease_ttl_secs: REFRESH_LEASE_TTL_SECS,
+            allow_unshared: false,
         }
     }
+}
+
+/// How long the token-endpoint call may take under a claim of
+/// `lease_ttl_secs`: the TTL minus a margin of 5 s (a third of the TTL for
+/// short test leases), so the claim never lapses while the token is in flight.
+pub fn refresh_deadline(lease_ttl_secs: i64) -> std::time::Duration {
+    let ttl_ms = lease_ttl_secs.max(1).saturating_mul(1_000);
+    let margin_ms = (ttl_ms / 3).min(5_000);
+    std::time::Duration::from_millis(u64::try_from(ttl_ms - margin_ms).unwrap_or(1_000))
 }
 
 /// Process-local registry of refresh-token fingerprints Anthropic rejected
@@ -132,10 +157,12 @@ pub enum RefreshFailure {
     /// The plugin declined to spend (claim timeout, unknown account,
     /// unreadable store, superseded commit). Nothing reached the endpoint.
     Refused,
-    /// The token family is gone (`invalid_grant`, expired refresh token, or
-    /// another permanent endpoint verdict). Re-login is required.
+    /// The token is gone: HTTP 400 `invalid_grant`, or the refresh token's
+    /// own expiry has passed. Re-login is required.
     Revoked,
-    /// Everything else: transport, 5xx, malformed response.
+    /// Everything else: transport, timeouts, 5xx, other 4xx
+    /// (`invalid_client`, `invalid_request`, …), malformed responses. None of
+    /// these says the token is dead.
     Error,
 }
 
@@ -144,12 +171,75 @@ pub fn classify_refresh_failure(error: &Error) -> RefreshFailure {
     match error {
         Error::RefreshRefused(_) => RefreshFailure::Refused,
         Error::RefreshTokenRevoked | Error::RefreshTokenExpired => RefreshFailure::Revoked,
-        Error::Endpoint {
-            permanent: true, ..
-        } => RefreshFailure::Revoked,
         other if other.is_invalid_grant() => RefreshFailure::Revoked,
         _ => RefreshFailure::Error,
     }
+}
+
+/// What the store says about a presented refresh token, read under the lock.
+enum Located {
+    /// A row holds exactly this token: spend it (the row's copy, with the
+    /// store's metadata) under that row's claim.
+    Held {
+        account_id: String,
+        tokens: OAuthTokens,
+    },
+    /// A row holds the same login with a different (newer) token.
+    Rotated {
+        account_id: String,
+        tokens: OAuthTokens,
+        live: bool,
+    },
+    /// No row knows this login, but the store's `current` credential is a
+    /// live peer rotation.
+    SharedLive {
+        account_id: Option<String>,
+        tokens: OAuthTokens,
+    },
+    /// The store has never held this token or this login.
+    Unknown,
+}
+
+fn same_login(stored: &OAuthTokens, presented: &OAuthTokens) -> bool {
+    let (Some(a), Some(b)) = (&stored.account, &presented.account) else {
+        return false;
+    };
+    !a.uuid.trim().is_empty()
+        && a.uuid == b.uuid
+        && stored.organization.as_ref().map(|o| &o.uuid)
+            == presented.organization.as_ref().map(|o| &o.uuid)
+}
+
+fn locate(store: &AccountStore, presented: &OAuthTokens, now: chrono::DateTime<Utc>) -> Located {
+    if let Some(account) = store.find_by_refresh_token(&presented.refresh)
+        && let Some(tokens) = account.oauth()
+    {
+        return Located::Held {
+            account_id: account.id.clone(),
+            tokens: tokens.clone(),
+        };
+    }
+    if let Some((account, tokens)) = store.accounts.iter().find_map(|account| {
+        let tokens = account.oauth()?;
+        same_login(tokens, presented).then_some((account, tokens))
+    }) {
+        return Located::Rotated {
+            account_id: account.id.clone(),
+            tokens: tokens.clone(),
+            live: account.oauth_credential_is_live(now)
+                && tokens.expires_at
+                    > now + Duration::seconds(crate::routing::SHARED_CREDENTIAL_ADOPTION_SKEW_SECS),
+        };
+    }
+    if let Some(tokens) =
+        crate::routing::adoptable_shared_credential(store, &presented.refresh, now)
+    {
+        return Located::SharedLive {
+            account_id: crate::routing::current_shared_account(store, now).map(|a| a.id.clone()),
+            tokens: tokens.clone(),
+        };
+    }
+    Located::Unknown
 }
 
 fn jitter_ms(base: u64) -> u64 {
@@ -171,37 +261,65 @@ impl OAuthClient {
         presented: &OAuthTokens,
         options: &SharedRefreshOptions,
     ) -> Result<SharedRefreshOutcome> {
-        let loaded = AccountStore::load_or_migrate_from(path, &[])
-            .map_err(|error| Error::RefreshRefused(format!("shared store unreadable: {error}")))?;
-        let store = loaded.store;
         let now = Utc::now();
-        let shared = store.find_by_refresh_token(&presented.refresh).cloned();
+        let located = AccountStore::read_locked(path, |store| Ok(locate(store, presented, now)))
+            .map_err(|error| Error::RefreshRefused(format!("shared store unreadable: {error}")))?;
 
-        let Some(shared) = shared else {
-            if let Some(adopted) =
-                crate::routing::adoptable_shared_credential(&store, &presented.refresh, now)
-            {
+        let (account_id, spend) = match located {
+            Located::Held { account_id, tokens } => (account_id, tokens),
+            Located::Rotated {
+                account_id,
+                tokens,
+                live: true,
+            } => {
                 return Ok(SharedRefreshOutcome {
-                    tokens: adopted.clone(),
-                    source: RefreshSource::AdoptedShared,
-                    account_id: crate::routing::current_shared_account(&store, now)
-                        .map(|a| a.id.clone()),
+                    tokens,
+                    source: RefreshSource::AdoptedPeer,
+                    account_id: Some(account_id),
                 });
             }
-            // A credential the store has never seen: only the process-local
-            // dead guard can protect it.
-            if DeadRefreshTokens::is_dead(presented.refresh.expose()) {
-                return Err(Error::RefreshTokenRevoked);
+            // The caller's token is stale and the store's session has expired
+            // too: spend the store's token, never the caller's.
+            Located::Rotated {
+                account_id,
+                tokens,
+                live: false,
+            } => (account_id, tokens),
+            Located::SharedLive { account_id, tokens } => {
+                return Ok(SharedRefreshOutcome {
+                    tokens,
+                    source: RefreshSource::AdoptedShared,
+                    account_id,
+                });
             }
-            let refreshed = self
-                .refresh(presented)
+            Located::Unknown => {
+                if !options.allow_unshared {
+                    return Err(Error::RefreshRefused(
+                        "the presented refresh token is not held by the shared store; \
+                         refusing to spend it"
+                            .into(),
+                    ));
+                }
+                // Explicitly unshared: only the process-local dead guard can
+                // protect it.
+                if DeadRefreshTokens::is_dead(presented.refresh.expose()) {
+                    return Err(Error::RefreshTokenRevoked);
+                }
+                let refreshed = match tokio::time::timeout(
+                    refresh_deadline(options.lease_ttl_secs),
+                    self.refresh(presented),
+                )
                 .await
-                .map_err(|error| remember_if_revoked(error, presented))?;
-            return Ok(SharedRefreshOutcome {
-                tokens: refreshed,
-                source: RefreshSource::Refreshed,
-                account_id: None,
-            });
+                {
+                    Ok(result) => result.map_err(|error| remember_if_revoked(error, presented))?,
+                    Err(_) => return Err(Error::Timeout("oauth token refresh".into())),
+                };
+                return Ok(SharedRefreshOutcome {
+                    tokens: refreshed,
+                    source: RefreshSource::Refreshed,
+                    account_id: None,
+                });
+            }
         };
 
         // Claim first and re-read under the claim: the store CAS after the
@@ -210,8 +328,8 @@ impl OAuthClient {
         let lease_id = loop {
             let claim = AccountStore::mutate(path, |store| {
                 Ok(store.claim_refresh(
-                    &shared.id,
-                    &presented.refresh,
+                    &account_id,
+                    &spend.refresh,
                     Utc::now(),
                     Duration::seconds(options.lease_ttl_secs),
                     Some(std::process::id()),
@@ -223,7 +341,7 @@ impl OAuthClient {
                     return Ok(SharedRefreshOutcome {
                         tokens,
                         source: RefreshSource::AdoptedPeer,
-                        account_id: Some(shared.id.clone()),
+                        account_id: Some(account_id),
                     });
                 }
                 RefreshClaim::DeadToken => return Err(Error::RefreshTokenRevoked),
@@ -249,10 +367,10 @@ impl OAuthClient {
         };
 
         let result = self
-            .refresh_claimed(path, &shared.id, &lease_id, presented, shared.oauth())
+            .refresh_claimed(path, &account_id, &lease_id, &spend, options)
             .await;
         if result.is_err() {
-            let _ = AccountStore::release_refresh_claim_at(path, &shared.id, &lease_id);
+            let _ = AccountStore::release_refresh_claim_at(path, &account_id, &lease_id);
         }
         result
     }
@@ -262,33 +380,53 @@ impl OAuthClient {
         path: &Path,
         account_id: &str,
         lease_id: &str,
-        presented: &OAuthTokens,
-        stored: Option<&OAuthTokens>,
+        spend: &OAuthTokens,
+        options: &SharedRefreshOptions,
     ) -> Result<SharedRefreshOutcome> {
-        if DeadRefreshTokens::is_dead(presented.refresh.expose()) {
+        if DeadRefreshTokens::is_dead(spend.refresh.expose()) {
             return Err(Error::RefreshTokenRevoked);
         }
-        // Prefer the store's row for prior metadata (refresh expiry, account,
-        // organization); the presented token is the same by construction.
-        let prior = stored.unwrap_or(presented);
-        let refreshed = match self.refresh(prior).await {
-            Ok(tokens) => tokens,
-            Err(error) => {
-                if error.is_invalid_grant() {
-                    DeadRefreshTokens::remember(presented.refresh.expose());
-                    let _ = AccountStore::mark_refresh_token_dead_at(
-                        path,
+        // Bounded inside the claim even when the caller supplied its own HTTP
+        // client (`with_http`) without a timeout.
+        let outcome = tokio::time::timeout(
+            refresh_deadline(options.lease_ttl_secs),
+            self.refresh(spend),
+        )
+        .await;
+        let refreshed = match outcome {
+            Ok(Ok(tokens)) => tokens,
+            Ok(Err(error)) if error.is_invalid_grant() => {
+                DeadRefreshTokens::remember(spend.refresh.expose());
+                // Marks only when the store still holds exactly this token:
+                // a peer's newer rotation never inherits the verdict.
+                let _ = AccountStore::mark_refresh_token_dead_at(path, account_id, &spend.refresh);
+                return Err(Error::RefreshTokenRevoked);
+            }
+            Ok(Err(error)) => {
+                let _ = AccountStore::mutate(path, |store| {
+                    Ok(store.record_refresh_error(
                         account_id,
-                        &presented.refresh,
-                    );
-                }
-                return Err(remember_if_revoked(error, presented));
+                        &spend.refresh,
+                        &format!("refresh failed: {error}"),
+                    ))
+                });
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = AccountStore::mutate(path, |store| {
+                    Ok(store.record_refresh_error(
+                        account_id,
+                        &spend.refresh,
+                        "refresh failed: token endpoint timed out",
+                    ))
+                });
+                return Err(Error::Timeout("oauth token refresh".into()));
             }
         };
         let committed = AccountStore::commit_refresh_at(
             path,
             account_id,
-            &presented.refresh,
+            &spend.refresh,
             Some(lease_id),
             refreshed.clone(),
         )?;
@@ -311,6 +449,15 @@ impl OAuthClient {
             .ok_or_else(|| {
                 Error::RefreshRefused("oauth refresh was superseded by an unusable row".into())
             })?;
+        if winner.refresh == spend.refresh {
+            // Nobody rotated the row, so the commit failed on the claim: it
+            // lapsed or was taken over while the token was in flight. The
+            // result is discarded rather than committed outside the claim.
+            return Err(Error::RefreshRefused(
+                "refresh claim lapsed before the result could be committed; the result was discarded"
+                    .into(),
+            ));
+        }
         Ok(SharedRefreshOutcome {
             tokens: winner,
             source: RefreshSource::AdoptedWinner,
@@ -716,14 +863,18 @@ mod tests {
         );
         let path2 = store_path("dead-unknown");
         seeded_store(&path2, &tokens(NEW_REFRESH, NEW_ACCESS, at(-10)));
+        let unshared = SharedRefreshOptions {
+            allow_unshared: true,
+            ..Default::default()
+        };
         let first = client(&url)
-            .refresh_shared(&path2, &unknown, &SharedRefreshOptions::default())
+            .refresh_shared(&path2, &unknown, &unshared)
             .await
             .unwrap_err();
         assert!(matches!(first, Error::RefreshTokenRevoked));
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         let second = client(&url)
-            .refresh_shared(&path2, &unknown, &SharedRefreshOptions::default())
+            .refresh_shared(&path2, &unknown, &unshared)
             .await
             .unwrap_err();
         assert!(matches!(second, Error::RefreshTokenRevoked));
@@ -800,17 +951,303 @@ mod tests {
         assert_eq!(outcome.source, RefreshSource::AdoptedShared);
         assert_eq!(outcome.tokens.refresh.expose(), NEW_REFRESH);
         assert_eq!(hits.load(Ordering::SeqCst), 0);
-        // When the shared credential is also expired, refresh normally.
+        // When the shared credential is also expired, a token the store has
+        // never held is not spent: it may be one a peer just rotated.
         let expired = tokens(NEW_REFRESH, NEW_ACCESS, at(-10));
         seeded_store(&path, &expired);
-        let outcome = client(&url)
+        let refused = client(&url)
             .refresh_shared(&path, &mine, &SharedRefreshOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, Error::RefreshRefused(_)), "{refused}");
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        // Only an explicit opt-in spends an unshared token.
+        let outcome = client(&url)
+            .refresh_shared(
+                &path,
+                &mine,
+                &SharedRefreshOptions {
+                    allow_unshared: true,
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(outcome.source, RefreshSource::Refreshed);
         assert_eq!(outcome.account_id, None);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// A token endpoint that records every presented refresh token, answers
+    /// with `status`/`body` after `delay`, and runs `before_answer` (a peer's
+    /// store write) before answering.
+    async fn recording_server(
+        status: u16,
+        body: &'static str,
+        delay: std::time::Duration,
+        before_answer: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let log = log.clone();
+                let before_answer = before_answer.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let body_start = loop {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers =
+                                String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                            let length = headers
+                                .lines()
+                                .find_map(|l| {
+                                    l.strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + length {
+                                break end + 4;
+                            }
+                        }
+                    };
+                    let json: serde_json::Value =
+                        serde_json::from_slice(&request[body_start..]).unwrap_or_default();
+                    if let Some(refresh) = json["refresh_token"].as_str() {
+                        log.lock().unwrap().push(refresh.to_owned());
+                    }
+                    tokio::time::sleep(delay).await;
+                    if let Some(hook) = before_answer {
+                        tokio::task::spawn_blocking(move || hook()).await.unwrap();
+                    }
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{address}"), seen)
+    }
+
+    fn with_identity(mut tokens: OAuthTokens) -> OAuthTokens {
+        tokens.account = Some(crate::token::TokenAccount {
+            uuid: "acct-uuid".into(),
+            email_address: Some("me@example.com".into()),
+        });
+        tokens.organization = Some(crate::token::TokenOrganization {
+            uuid: "org-uuid".into(),
+        });
+        tokens
+    }
+
+    #[tokio::test]
+    async fn a_stale_caller_token_is_never_spent_the_stores_token_is() {
+        let (url, seen) =
+            recording_server(200, ROTATED_BODY, std::time::Duration::ZERO, None).await;
+        let path = store_path("stale-caller");
+        // The store already holds a newer rotation of the same login.
+        let store_row = with_identity(tokens(
+            "sk-ant-ort01-store-newer-aaaaaaaaaaaaaaaaaa",
+            "sk-ant-oat01-store-newer-aaaaaaaaaaaaaaaaaa",
+            Utc::now() + Duration::hours(2),
+        ));
+        seeded_store(&path, &store_row);
+        let stale = with_identity(old_tokens("stale-caller"));
+
+        // Live store session: adopted, nothing presented.
+        let adopted = client(&url)
+            .refresh_shared(&path, &stale, &SharedRefreshOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(adopted.source, RefreshSource::AdoptedPeer);
+        assert_eq!(adopted.tokens.refresh, store_row.refresh);
+        assert!(seen.lock().unwrap().is_empty());
+
+        // Expired store session: the store's token is refreshed, the
+        // caller's stale one never reaches the endpoint.
+        let mut expired = store_row.clone();
+        expired.expires_at = at(-10);
+        seeded_store(&path, &expired);
+        let refreshed = client(&url)
+            .refresh_shared(&path, &stale, &SharedRefreshOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(refreshed.source, RefreshSource::Refreshed);
+        assert_eq!(refreshed.account_id.as_deref(), Some("shared"));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![store_row.refresh.expose().to_owned()],
+            "only the store's refresh token may be spent"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_stalled_token_call_is_cut_off_inside_the_claim_and_never_committed() {
+        let (url, seen) =
+            recording_server(200, ROTATED_BODY, std::time::Duration::from_secs(40), None).await;
+        const TAG: &str = "stall";
+        let path = store_path(TAG);
+        let presented = old_tokens(TAG);
+        seeded_store(&path, &presented);
+        // A caller-supplied client with no timeout at all.
+        let mut endpoints = Endpoints::prod();
+        endpoints.token_url = url;
+        let client = OAuthClient::with_http(reqwest::Client::new(), endpoints);
+        let options = SharedRefreshOptions {
+            lease_ttl_secs: 3,
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.refresh_shared(&path, &presented, &options),
+        )
+        .await
+        .expect("the refresh must give up inside the claim")
+        .unwrap_err();
+        assert!(matches!(error, Error::Timeout(_)), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert_eq!(classify_refresh_failure(&error), RefreshFailure::Error);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        let row = AccountStore::load(&path).unwrap();
+        let row = row.get("shared").unwrap();
+        // Nothing committed, nothing marked dead, the claim released, and the
+        // failure noted against this token only.
+        assert_eq!(row.oauth().unwrap().refresh, presented.refresh);
+        assert!(!row.refresh_token_is_dead());
+        assert!(row.refresh_lease.is_none());
+        assert!(row.current_error().is_some_and(|e| e.contains("timed out")));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn only_a_400_invalid_grant_marks_the_token_dead() {
+        for (status, body) in [
+            (400u16, r#"{"error":"invalid_client"}"#),
+            (
+                400,
+                r#"{"error":"invalid_request","error_description":"not invalid_grant"}"#,
+            ),
+            (401, r#"{"error":"invalid_grant"}"#),
+            (500, r#"{"error":"invalid_grant"}"#),
+        ] {
+            let (url, hits) = token_server(status, body).await;
+            let tag = format!("transient-{status}-{}", body.len());
+            let path = store_path(&tag);
+            let presented = old_tokens(&tag);
+            seeded_store(&path, &presented);
+            let error = client(&url)
+                .refresh_shared(&path, &presented, &SharedRefreshOptions::default())
+                .await
+                .unwrap_err();
+            assert!(
+                !matches!(error, Error::RefreshTokenRevoked),
+                "{status} {body}"
+            );
+            assert_eq!(
+                classify_refresh_failure(&error),
+                RefreshFailure::Error,
+                "{status} {body}"
+            );
+            let row = AccountStore::load(&path).unwrap();
+            let row = row.get("shared").unwrap();
+            assert!(!row.refresh_token_is_dead(), "{status} {body}");
+            assert!(row.dead_refresh_fingerprint.is_none());
+            assert!(!DeadRefreshTokens::is_dead(presented.refresh.expose()));
+            // Still refreshable: a transient failure never strands the login.
+            let again = client(&url)
+                .refresh_shared(&path, &presented, &SharedRefreshOptions::default())
+                .await
+                .unwrap_err();
+            assert!(!matches!(again, Error::RefreshTokenRevoked));
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_grant_on_a_token_the_store_no_longer_holds_marks_nothing() {
+        const TAG: &str = "dead-rotated";
+        let path = store_path(TAG);
+        let presented = old_tokens(TAG);
+        seeded_store(&path, &presented);
+        // While our POST is in flight, a peer (which never claims, like a
+        // fail-open host) rotates the row.
+        let peer_path = path.clone();
+        let peer_expected = presented.refresh.clone();
+        let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let rotated = tokens(
+                "sk-ant-ort01-peer-rotated-aaaaaaaaaaaaaaaaa",
+                "sk-ant-oat01-peer-rotated-aaaaaaaaaaaaaaaaa",
+                Utc::now() + Duration::hours(8),
+            );
+            assert!(
+                AccountStore::replace_oauth_after_refresh(
+                    &peer_path,
+                    "shared",
+                    &peer_expected,
+                    rotated
+                )
+                .unwrap()
+            );
+        });
+        let (url, _seen) = recording_server(
+            400,
+            INVALID_GRANT_BODY,
+            std::time::Duration::ZERO,
+            Some(hook),
+        )
+        .await;
+        let error = client(&url)
+            .refresh_shared(&path, &presented, &SharedRefreshOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::RefreshTokenRevoked));
+        let stored = AccountStore::load(&path).unwrap();
+        let row = stored.get("shared").unwrap();
+        assert_eq!(
+            row.oauth().unwrap().refresh.expose(),
+            "sk-ant-ort01-peer-rotated-aaaaaaaaaaaaaaaaa"
+        );
+        assert!(row.dead_refresh_fingerprint.is_none());
+        assert!(!row.refresh_token_is_dead());
+        assert!(row.current_error().is_none());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn the_refresh_deadline_always_ends_inside_the_claim() {
+        for ttl in [1, 3, 10, 30, 120] {
+            let deadline = refresh_deadline(ttl);
+            assert!(
+                deadline < std::time::Duration::from_secs(ttl as u64),
+                "{ttl}"
+            );
+            assert!(!deadline.is_zero());
+        }
+        assert_eq!(
+            refresh_deadline(REFRESH_LEASE_TTL_SECS),
+            std::time::Duration::from_secs(25)
+        );
     }
 
     #[test]
@@ -832,6 +1269,18 @@ mod tests {
         assert_eq!(
             classify_refresh_failure(&Error::RefreshRefused("x".into())),
             RefreshFailure::Refused
+        );
+        // A permanent 4xx that is not invalid_grant says nothing about the
+        // token: it is not reported as revoked.
+        assert_eq!(
+            classify_refresh_failure(&Error::Endpoint {
+                status: 400,
+                permanent: true,
+                error_code: Some("invalid_client".into()),
+                retry_after_ms: None,
+                body: String::new()
+            }),
+            RefreshFailure::Error
         );
         let invalid = Error::Endpoint {
             status: 400,

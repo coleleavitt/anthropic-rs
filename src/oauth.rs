@@ -307,6 +307,35 @@ pub(crate) fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Opti
     Some((secs.saturating_mul(1000)).clamp(0, MAX_RETRY_AFTER_MS))
 }
 
+/// Connect timeout of the client [`OAuthClient::new`] builds.
+#[cfg(feature = "client")]
+pub const OAUTH_HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whole-request timeout of the client [`OAuthClient::new`] builds. Strictly
+/// shorter than the 30 s refresh claim
+/// ([`crate::refresh_claim::REFRESH_LEASE_TTL_SECS`]): a token POST that
+/// outlived the claim would let a second process claim and present the same
+/// refresh token, which revokes the family.
+#[cfg(feature = "client")]
+pub const OAUTH_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+#[cfg(all(feature = "client", feature = "store"))]
+const _: () = assert!(
+    OAUTH_HTTP_TIMEOUT.as_secs() < crate::refresh_claim::REFRESH_LEASE_TTL_SECS as u64
+        && OAUTH_HTTP_CONNECT_TIMEOUT.as_secs() < OAUTH_HTTP_TIMEOUT.as_secs()
+);
+
+/// The HTTP client [`OAuthClient::new`] uses: rustls, with
+/// [`OAUTH_HTTP_CONNECT_TIMEOUT`] and [`OAUTH_HTTP_TIMEOUT`].
+#[cfg(feature = "client")]
+pub fn default_oauth_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(OAUTH_HTTP_CONNECT_TIMEOUT)
+        .timeout(OAUTH_HTTP_TIMEOUT)
+        .build()
+        .unwrap_or_default()
+}
+
 /// Async client for the Anthropic OAuth token endpoint.
 #[cfg(feature = "client")]
 #[derive(Clone)]
@@ -317,15 +346,20 @@ pub struct OAuthClient {
 
 #[cfg(feature = "client")]
 impl OAuthClient {
-    /// Client with a fresh default [`reqwest::Client`].
+    /// Client with a fresh [`reqwest::Client`] bounded by
+    /// [`OAUTH_HTTP_CONNECT_TIMEOUT`] and [`OAUTH_HTTP_TIMEOUT`].
     pub fn new(endpoints: Endpoints) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: default_oauth_http_client(),
             endpoints,
         }
     }
 
     /// Client reusing a caller-provided [`reqwest::Client`] (shared pool).
+    ///
+    /// The caller's client may have no timeout; the shared refresh path
+    /// ([`OAuthClient::refresh_shared`]) bounds its own token POST inside the
+    /// claim regardless.
     pub fn with_http(http: reqwest::Client, endpoints: Endpoints) -> Self {
         Self { http, endpoints }
     }
@@ -1053,5 +1087,50 @@ mod tests {
             .unwrap();
         request.await.unwrap();
         assert_eq!(outcome, RevokeOutcome::AlreadyInactive);
+    }
+
+    /// A token endpoint that accepts the connection, reads the request and
+    /// then never answers.
+    #[cfg(feature = "client")]
+    async fn stalling_server() -> String {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut chunk = [0u8; 4096];
+                let _ = stream.read(&mut chunk).await;
+                // Keep the socket open and silent.
+                held.push(stream);
+            }
+        });
+        format!("http://{address}")
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn the_default_client_gives_up_before_the_refresh_claim_lapses() {
+        let base = stalling_server().await;
+        let mut endpoints = Endpoints::prod();
+        endpoints.token_url = format!("{base}/v1/oauth/token");
+        let mut prior = prior_tokens();
+        prior.refresh_expires_at = Some(Utc::now() + Duration::days(30));
+        let started = std::time::Instant::now();
+        // 28 s: past the client's own timeout, inside the 30 s claim.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(28),
+            OAuthClient::new(endpoints).refresh(&prior),
+        )
+        .await
+        .expect("the OAuth client must time out on its own, inside the refresh claim");
+        let error = outcome.expect_err("a stalled token endpoint cannot succeed");
+        assert!(
+            matches!(error, Error::Http(ref e) if e.is_timeout()),
+            "{error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(28));
+        assert!(!error.is_permanent());
     }
 }

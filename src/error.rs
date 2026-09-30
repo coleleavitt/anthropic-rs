@@ -58,6 +58,13 @@ pub enum Error {
     #[error("oauth refresh refused (fail-closed): {0}")]
     RefreshRefused(String),
 
+    /// A network call did not finish inside its deadline. For a refresh this
+    /// is deliberately shorter than the refresh claim, so the claim never
+    /// lapses while the token is in flight. Transient; the token may or may
+    /// not have been spent, and a result that arrives late is discarded.
+    #[error("timed out: {0}")]
+    Timeout(String),
+
     /// The token response was missing or malformed in a field required for a
     /// usable session.
     #[error("token response invalid: {0}")]
@@ -196,6 +203,7 @@ impl Error {
     pub fn is_permanent(&self) -> bool {
         match self {
             Error::Endpoint { permanent, .. } => *permanent,
+            Error::Timeout(_) => false,
             Error::StateMismatch
             | Error::ExpiredNoRefresh
             | Error::RefreshTokenExpired
@@ -239,15 +247,49 @@ impl Error {
         matches!(self, Error::Endpoint { status: 429, .. })
     }
 
-    /// Whether the token endpoint reported `invalid_grant`: the refresh
-    /// token's family is revoked and no retry can succeed.
+    /// Whether the token endpoint rejected the refresh token: HTTP 400 whose
+    /// parsed `error` is exactly `invalid_grant`, or the local
+    /// [`Error::RefreshTokenRevoked`] verdict. Nothing else qualifies — not a
+    /// body that merely mentions the text, not another status, not another
+    /// OAuth error code — because this is the only signal that marks a token
+    /// dead, and a false positive strands a working login.
     pub fn is_invalid_grant(&self) -> bool {
         match self {
             Error::RefreshTokenRevoked => true,
             Error::Endpoint {
-                error_code, body, ..
-            } => error_code.as_deref() == Some("invalid_grant") || body.contains("invalid_grant"),
+                status: 400,
+                error_code,
+                ..
+            } => error_code.as_deref() == Some("invalid_grant"),
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn endpoint(status: u16, error_code: Option<&str>, body: &str) -> Error {
+        Error::Endpoint {
+            status,
+            permanent: true,
+            error_code: error_code.map(str::to_owned),
+            retry_after_ms: None,
+            body: body.to_owned(),
+        }
+    }
+
+    #[test]
+    fn only_a_400_with_the_invalid_grant_code_is_invalid_grant() {
+        assert!(endpoint(400, Some("invalid_grant"), "").is_invalid_grant());
+        assert!(Error::RefreshTokenRevoked.is_invalid_grant());
+        // The body merely mentioning it is not the verdict.
+        assert!(!endpoint(400, None, "upstream said invalid_grant somewhere").is_invalid_grant());
+        assert!(!endpoint(400, Some("invalid_client"), "invalid_grant").is_invalid_grant());
+        // Any other status is not the verdict either.
+        assert!(!endpoint(401, Some("invalid_grant"), "").is_invalid_grant());
+        assert!(!endpoint(500, Some("invalid_grant"), "").is_invalid_grant());
+        assert!(!Error::Timeout("refresh".into()).is_permanent());
     }
 }
