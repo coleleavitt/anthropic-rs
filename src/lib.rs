@@ -52,6 +52,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+#[cfg(all(feature = "client", feature = "store"))]
+pub mod access;
 pub mod account;
 pub mod billing;
 pub mod cch;
