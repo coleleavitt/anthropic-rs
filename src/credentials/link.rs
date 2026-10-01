@@ -13,8 +13,9 @@
 //!
 //! - **Link by identity.** A row is *linked* when its account uuid and
 //!   organization uuid equal Claude Code's `oauthAccount.{accountUuid,
-//!   organizationUuid}` in `.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json`,
-//!   else `~/.claude.json`). When `.claude.json` names no identity, the
+//!   organizationUuid}` in `.claude.json` (`~/.claude.json` by default and
+//!   for `CLAUDE_CONFIG_DIR=~/.claude`; a custom `CLAUDE_CONFIG_DIR`'s own
+//!   `.claude.json`; see [`ClaudeCodeFiles::from_lookup`]). When `.claude.json` names no identity, the
 //!   identity of a store row that already holds Claude Code's exact token is
 //!   used. Linking never calls the network.
 //! - **Newest copy wins** ([`reconcile_claude_code_link`]). When the two
@@ -92,14 +93,23 @@ pub struct ClaudeCodeFiles {
 
 impl ClaudeCodeFiles {
     /// Claude Code's own files from an environment lookup: the credential
-    /// file as [`super::native_claude_credentials_path_from_lookup`],
-    /// `$CLAUDE_CONFIG_DIR/.claude.json`, else `$HOME/.claude.json`, and the
+    /// file as [`super::native_claude_credentials_path_from_lookup`], the
     /// backend as [`CredentialBackend::from_lookup`] (the Keychain on macOS
-    /// when there is no `.credentials.json`).
+    /// when there is no `.credentials.json`), and `.claude.json`:
+    ///
+    /// - no (or an empty) `CLAUDE_CONFIG_DIR`: `$HOME/.claude.json`;
+    /// - a `CLAUDE_CONFIG_DIR`: the same rule as
+    ///   [`ClaudeCodeFiles::for_credentials`] applies to that directory, so
+    ///   `CLAUDE_CONFIG_DIR=~/.claude` without its own `.claude.json` still
+    ///   finds `~/.claude.json`, and any directory holding a `.claude.json`
+    ///   keeps it.
+    ///
+    /// `CLAUDE_SECURESTORAGE_CONFIG_DIR` moves only the credential file,
+    /// never `.claude.json`.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         let credentials = super::native_claude_credentials_path_from_lookup(&lookup);
         let config = match lookup("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
-            Some(directory) => PathBuf::from(directory).join(NATIVE_CONFIG_FILE_NAME),
+            Some(directory) => config_for_directory(Path::new(&directory)),
             None => {
                 let home = lookup("HOME")
                     .filter(|v| !v.is_empty())
@@ -127,20 +137,9 @@ impl ClaudeCodeFiles {
     /// default `~/.claude` + `~/.claude.json` layout).
     pub fn for_credentials(credentials: &Path) -> Self {
         let directory = credentials.parent().unwrap_or_else(|| Path::new("."));
-        let inside = directory.join(NATIVE_CONFIG_FILE_NAME);
-        let config = if std::fs::symlink_metadata(&inside).is_err()
-            && directory.file_name().is_some_and(|n| n == ".claude")
-        {
-            directory
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(NATIVE_CONFIG_FILE_NAME)
-        } else {
-            inside
-        };
         Self {
             credentials: credentials.to_path_buf(),
-            config,
+            config: config_for_directory(directory),
             backend: CredentialBackend::File,
         }
     }
@@ -155,6 +154,23 @@ impl ClaudeCodeFiles {
     /// Claude Code's config directory (where its locks live).
     pub fn config_directory(&self) -> &Path {
         self.credentials.parent().unwrap_or_else(|| Path::new("."))
+    }
+}
+
+/// `.claude.json` for a Claude Code config directory: the one inside it when
+/// there is one, else, for a `.claude` directory, the one beside it (the
+/// default `~/.claude` + `~/.claude.json` layout).
+fn config_for_directory(directory: &Path) -> PathBuf {
+    let inside = directory.join(NATIVE_CONFIG_FILE_NAME);
+    if std::fs::symlink_metadata(&inside).is_err()
+        && directory.file_name().is_some_and(|n| n == ".claude")
+    {
+        directory
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(NATIVE_CONFIG_FILE_NAME)
+    } else {
+        inside
     }
 }
 
@@ -819,6 +835,93 @@ mod tests {
         assert_eq!(NativePublish::Auto.files(true), None, "test mode");
         assert_eq!(NativePublish::Off.files(false), None);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A lookup over a temp `HOME` plus extra variables (never the real
+    /// environment).
+    fn lookup_in(
+        home: &Path,
+        extra: &[(&'static str, PathBuf)],
+    ) -> impl Fn(&str) -> Option<String> {
+        let mut vars = vec![("HOME", home.to_string_lossy().into_owned())];
+        vars.extend(
+            extra
+                .iter()
+                .map(|(k, v)| (*k, v.to_string_lossy().into_owned())),
+        );
+        move |key: &str| vars.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone())
+    }
+
+    /// Lay out the default `~/.claude/.credentials.json` + `~/.claude.json`.
+    fn default_layout(home: &Path) -> PathBuf {
+        let dot_claude = home.join(".claude");
+        std::fs::create_dir_all(&dot_claude).unwrap();
+        std::fs::write(dot_claude.join(".credentials.json"), b"{}").unwrap();
+        std::fs::write(home.join(NATIVE_CONFIG_FILE_NAME), b"{}").unwrap();
+        dot_claude
+    }
+
+    #[test]
+    fn claude_json_is_in_home_by_default() {
+        let home = temp_dir("cj-default");
+        default_layout(&home);
+        let files = ClaudeCodeFiles::from_lookup(lookup_in(&home, &[]));
+        assert_eq!(
+            files.credentials,
+            home.join(".claude").join(".credentials.json")
+        );
+        assert_eq!(files.config, home.join(NATIVE_CONFIG_FILE_NAME));
+        assert_eq!(
+            files.config,
+            ClaudeCodeFiles::for_credentials(&files.credentials).config
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn claude_config_dir_naming_the_default_keeps_claude_json_in_home() {
+        let home = temp_dir("cj-default-dir");
+        let dot_claude = default_layout(&home);
+        let files =
+            ClaudeCodeFiles::from_lookup(lookup_in(&home, &[("CLAUDE_CONFIG_DIR", dot_claude)]));
+        assert_eq!(files.config, home.join(NATIVE_CONFIG_FILE_NAME));
+        assert_eq!(
+            files.config,
+            ClaudeCodeFiles::for_credentials(&files.credentials).config
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_custom_claude_config_dir_keeps_its_own_claude_json() {
+        let home = temp_dir("cj-custom");
+        default_layout(&home);
+        // A custom dir that is also named `.claude` (the case the sibling
+        // fallback must not hijack) and holds its own `.claude.json`.
+        let custom = home.join("profiles").join(".claude");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(custom.join(".credentials.json"), b"{}").unwrap();
+        std::fs::write(custom.join(NATIVE_CONFIG_FILE_NAME), b"{}").unwrap();
+        let files = ClaudeCodeFiles::from_lookup(lookup_in(
+            &home,
+            &[("CLAUDE_CONFIG_DIR", custom.clone())],
+        ));
+        assert_eq!(files.credentials, custom.join(".credentials.json"));
+        assert_eq!(files.config, custom.join(NATIVE_CONFIG_FILE_NAME));
+        // A secure-storage dir moves only the credential file, never
+        // `.claude.json`.
+        let secure = home.join("secure");
+        std::fs::create_dir_all(&secure).unwrap();
+        let files = ClaudeCodeFiles::from_lookup(lookup_in(
+            &home,
+            &[
+                ("CLAUDE_CONFIG_DIR", custom.clone()),
+                ("CLAUDE_SECURESTORAGE_CONFIG_DIR", secure.clone()),
+            ],
+        ));
+        assert_eq!(files.credentials, secure.join(".credentials.json"));
+        assert_eq!(files.config, custom.join(NATIVE_CONFIG_FILE_NAME));
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
