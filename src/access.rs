@@ -7,7 +7,11 @@
 //! stay inside the crate and the store.
 //!
 //! Selection order is the store's routing order (`current` first). An account
-//! whose access token is live is used as-is. Otherwise each candidate in turn
+//! linked to Claude Code's login (same account and organization; see
+//! [`crate::credentials::reconcile_claude_code_link`]) is first brought into
+//! step with it, and while Claude Code's access token is live that token is
+//! handed out ([`AccessSource::ClaudeCode`]) and nothing is refreshed. An
+//! account whose access token is live is used as-is. Otherwise each candidate in turn
 //! is refreshed through [`crate::OAuthClient::refresh_shared`] (claimed,
 //! store-custodied, fail-closed), so one dead login rotates to the next
 //! instead of failing the request.
@@ -51,6 +55,21 @@ pub enum AccessSource {
     Refreshed,
     /// A peer had already rotated the account; its session was adopted.
     Adopted,
+    /// The account is linked to Claude Code's login and Claude Code's live
+    /// access token was borrowed (one login per account).
+    ClaudeCode,
+}
+
+impl AccessSource {
+    /// The stable wire code (`store`, `refreshed`, `adopted`, `claude_code`).
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Store => "store",
+            Self::Refreshed => "refreshed",
+            Self::Adopted => "adopted",
+            Self::ClaudeCode => "claude_code",
+        }
+    }
 }
 
 /// A usable bearer. Holds the access token only, never the refresh token.
@@ -344,7 +363,41 @@ pub async fn get_access_token(
         .store;
     let candidates = access_candidates(&store, request, now)?;
 
+    // One login per account: Claude Code's login, read once (no network).
+    let files = client.claude_code_files();
+    let login = files
+        .as_ref()
+        .and_then(|files| crate::credentials::read_claude_code_login(files, Some(&store)));
     for account in &candidates {
+        if let (Some(files), Some(login)) = (&files, &login)
+            && crate::credentials::is_linked(account, &login.identity)
+        {
+            // The row's own copy may be the revoked one: judge the reconciled
+            // session, never the snapshot. Expired: the refresh pass below
+            // goes through `refresh_shared`, which refreshes under Claude
+            // Code's lock.
+            let (path, files, id) = (path.to_path_buf(), files.clone(), account.id.clone());
+            let reconciled = tokio::task::spawn_blocking(move || {
+                crate::credentials::reconcile_claude_code_link(&path, &files, &id)
+            })
+            .await
+            .map_err(|e| AccessError::new(AccessErrorKind::Transient, e.to_string()))?
+            .map_err(|e| AccessError::from_error(&e))?;
+            match reconciled {
+                crate::credentials::LinkReconcile::Native { tokens, .. }
+                    if !tokens.needs_refresh(now) =>
+                {
+                    return Ok(grant(account, &tokens, AccessSource::ClaudeCode));
+                }
+                crate::credentials::LinkReconcile::Store { tokens, .. }
+                    if !tokens.needs_refresh(now) =>
+                {
+                    return Ok(grant(account, &tokens, AccessSource::Store));
+                }
+                crate::credentials::LinkReconcile::NotLinked => {}
+                _ => continue,
+            }
+        }
         if let Some(tokens) = account.oauth()
             && !tokens.access.expose().is_empty()
             && !tokens.needs_refresh(now)
@@ -365,10 +418,10 @@ pub async fn get_access_token(
         refreshable += 1;
         match client.refresh_shared(path, tokens, options).await {
             Ok(outcome) => {
-                let source = if outcome.source == RefreshSource::Refreshed {
-                    AccessSource::Refreshed
-                } else {
-                    AccessSource::Adopted
+                let source = match outcome.source {
+                    RefreshSource::Refreshed => AccessSource::Refreshed,
+                    RefreshSource::ClaudeCode => AccessSource::ClaudeCode,
+                    _ => AccessSource::Adopted,
                 };
                 let id = outcome
                     .account_id

@@ -22,6 +22,10 @@
 //!   [`crate::OAuthClient::refresh_shared`] path, so the keep-alive is just
 //!   another well-behaved peer.
 //!
+//! - **Never a login Claude Code is using.** A row linked to Claude Code's
+//!   login (same account and organization) is skipped while Claude Code's
+//!   access token is live: Claude Code keeps that chain alive itself.
+//!
 //! Nothing else in this crate rotates an idle account.
 
 use chrono::{DateTime, Duration, Utc};
@@ -175,6 +179,9 @@ pub enum KeepAliveSkip {
     NotDue,
     /// The pass ran out of lease time before reaching it.
     Deferred,
+    /// Linked to Claude Code's login, whose access token is live: Claude
+    /// Code keeps its own chain alive (one login per account).
+    ClaudeCodeLive,
 }
 
 /// Whether `account` is due for a keep-alive refresh at `now`.
@@ -342,10 +349,22 @@ impl crate::oauth::OAuthClient {
         let mut report = KeepAliveReport::empty(KeepAliveLeaseOutcome::Acquired);
         let result = async {
             let snapshot = AccountStore::read_locked(path, |store| Ok(store.clone()))?;
+            let claude_code = self.claude_code_files().and_then(|files| {
+                crate::credentials::read_claude_code_login(&files, Some(&snapshot))
+            });
             let mut first = true;
             for account in &snapshot.accounts {
                 if let Err(skip) = keepalive_verdict(account, now, options) {
                     report.skipped.push((account.id.clone(), skip));
+                    continue;
+                }
+                if let Some(login) = &claude_code
+                    && crate::credentials::is_linked(account, &login.identity)
+                    && !login.tokens.is_expired(now)
+                {
+                    report
+                        .skipped
+                        .push((account.id.clone(), KeepAliveSkip::ClaudeCodeLive));
                     continue;
                 }
                 if started.elapsed() >= budget {
@@ -810,6 +829,82 @@ mod tests {
                     .is_some_and(|e| e.starts_with("keep-alive refresh failed"))
             );
             std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+
+        #[tokio::test]
+        async fn a_row_linked_to_a_live_claude_code_login_is_left_to_claude_code() {
+            let (url, seen) = rotating_server(std::time::Duration::ZERO).await;
+            let path = store_path("claude-code");
+            let identify = |mut account: Account| {
+                if let Credential::Oauth(t) = &mut account.credential {
+                    t.account = Some(crate::token::TokenAccount {
+                        uuid: "acct-ka".into(),
+                        email_address: None,
+                    });
+                    t.organization = Some(crate::token::TokenOrganization {
+                        uuid: "org-ka".into(),
+                    });
+                }
+                account
+            };
+            // Both rows are due (refresh token expiring); only `linked` is
+            // Claude Code's account.
+            AccountStore {
+                accounts: vec![
+                    identify(real_row("linked", Duration::hours(-1), Duration::days(3))),
+                    real_row("other", Duration::hours(-1), Duration::days(3)),
+                ],
+                ..AccountStore::default()
+            }
+            .save(&path)
+            .unwrap();
+            let dir = path.parent().unwrap();
+            let credentials = dir.join(".credentials.json");
+            let write = |path: &std::path::Path, value: serde_json::Value| {
+                std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                }
+            };
+            write(
+                &credentials,
+                serde_json::json!({ "claudeAiOauth": {
+                    "accessToken": "sk-ant-oat01-claude-code-live-aaaaaaaaaaaa",
+                    "refreshToken": "sk-ant-ort01-claude-code-live-aaaaaaaaaaaa",
+                    "expiresAt": (Utc::now() + Duration::hours(5)).timestamp_millis(),
+                    "scopes": ["user:inference"]
+                }}),
+            );
+            write(
+                &dir.join(".claude.json"),
+                serde_json::json!({ "oauthAccount": {
+                    "accountUuid": "acct-ka", "organizationUuid": "org-ka"
+                }}),
+            );
+            let before = std::fs::read(&credentials).unwrap();
+            let report = client(&url)
+                .native_publish(crate::credentials::NativePublish::At(credentials.clone()))
+                .keep_alive_once(&path, Utc::now(), &fast())
+                .await
+                .unwrap();
+            assert!(
+                report
+                    .skipped
+                    .contains(&("linked".to_owned(), KeepAliveSkip::ClaudeCodeLive)),
+                "{report:?}"
+            );
+            assert_eq!(
+                report.refreshed,
+                vec![("other".to_owned(), KeepAliveReason::RefreshExpiring)]
+            );
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec!["sk-ant-ort01-other-aaaaaaaaaaaaaaaaaaaa".to_owned()]
+            );
+            assert_eq!(std::fs::read(&credentials).unwrap(), before);
+            std::fs::remove_dir_all(dir).ok();
         }
 
         #[tokio::test]

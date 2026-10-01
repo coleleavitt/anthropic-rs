@@ -58,14 +58,14 @@ because Bun's `process.env` writes do not reach the native `getenv`.
 | `markRateLimited`, `recordQuota`, `recordQuotaHeaders`, `markUsed` | routing bookkeeping |
 | `setAccountEnabled`, `removeAccount`, `reorderAccounts`, `setCurrent` | row management |
 | `startLogin({mode, loginHint, redirectUri, state})` | PKCE login; the verifier stays in Rust. `redirectUri`/`state` bind one login to a loopback listener |
-| `completeLogin({loginId, callback, label, setCurrent})` | exchange and store (in place for a known login); an anonymous grant is named from the profile endpoint |
+| `completeLogin({loginId, callback, label, setCurrent})` | exchange and store (in place for a known login); an anonymous grant is named from the profile endpoint. A login of the account Claude Code is logged into replaces Claude Code's: it is published to Claude Code's file and `warning` / `claudeCodePublish` say so |
 | `exchangeCode({loginId, callback})` | exchange **without storing** (Console API-key mint); returns the access token only |
 | `importOAuthAccount({...})` | one-time move of a host-held credential into the store (the store's copy wins) |
 | `addApiKey({label, key})` / `getApiKey({account, allowlist})` | `api_key` rows |
 | `revokeAccount({accountId, disable})` | revoke the refresh token at the revoke URL under the row's claim, then remove (or disable) the row; a failed request changes nothing |
 | `backfillIdentities()` | fill uuid/email/organization of unidentified rows with their live access token; never refreshes |
-| `readNativeClaudeOAuth({path})` | non-secret facts about Claude Code's credential file (+ the store row holding its token) |
-| `importNativeClaudeAccount({path, label})` | import Claude Code's credential; tokens stay in Rust |
+| `readNativeClaudeOAuth({path})` | non-secret facts about Claude Code's credential file (+ the store row holding its token, Claude Code's account, and the linked row) |
+| `importNativeClaudeAccount({path, label})` | **link** the store to Claude Code's login (status `linked`): the row of Claude Code's account adopts its newer login or publishes its own newer one, or a new row is created; without an identity, the one-time copy. Tokens stay in Rust |
 
 Errors are `AnthropicAuthError` with `.code` one of `auth_required`,
 `quota_reserve`, `invalid_grant`, `config` (bad option, or test mode refused a
@@ -74,19 +74,34 @@ host), `invalid_token` (a token or key passed in is malformed),
 symlink or is group/world readable; nothing was written) or `transient`.
 Messages are secret-redacted. `index.d.ts` documents every field.
 
-### Claude Code credential publish
+### One login per account (Claude Code link)
 
-When the store spends a refresh token that Claude Code's
-`.credentials.json` also holds (the login came from `import-native`, or both
-were seeded with the same grant), Anthropic's rotation would otherwise kill
-Claude Code's login at its next refresh. After a rotation it committed, the
-binding writes the new access/refresh/expiry into that file, but only when the
-file still holds exactly the spent token; it never creates the file, never
-follows a symlink, never overwrites a file it cannot parse, keeps every other
-field, writes 0600 through a temp file and rename, and takes Claude Code's own
-credential-write lock (`<config dir>/.storage-write.lock`, `proper-lockfile`
-compatible). The same policy (`NativePublish`) is the crate default, so ckl
-and any other Rust consumer behave the same way.
+Logging into an Anthropic account revokes that account's older login: Claude
+Code and the store cannot each hold an independent login of the same
+account. A row whose account uuid and organization uuid equal Claude Code's
+`.claude.json` `oauthAccount` is **linked** (`listAccounts` → `claudeCodeLinked`),
+and the two share one login, kept in step both ways (newest copy wins):
+
+- `getAccessToken` hands out Claude Code's live access token (`source:
+  'claude_code'`) and refreshes nothing; when it has expired, the binding
+  refreshes once under Claude Code's own refresh lock and publishes the
+  rotation back.
+- A newer Claude Code login (the operator ran `claude /login`) is adopted into
+  the row: id, label and quota kept, the stale error and dead verdict cleared.
+  An `invalid_grant` on a linked row heals this way instead of marking it dead.
+- A newer store login (`completeLogin`) or rotation is published to Claude
+  Code's `.credentials.json` by account, even over its older (now revoked)
+  token; never to a different account, never over a newer Claude Code login.
+- `keepAliveOnce` skips linked rows while Claude Code's token is live
+  (`claude_code_live`).
+
+Every write to Claude Code's file keeps the old safety: never created, never
+through a symlink, never over a file it cannot parse, every other field kept,
+0600 through a temp file and rename, under Claude Code's credential-write lock
+(`<config dir>/.storage-write.lock`, `proper-lockfile` compatible). The link
+follows `nativePublish`: `'off'` or `ANTHROPIC_NATIVE_PUBLISH=0` turns it off.
+The same policy (`NativePublish`) is the crate default, so ckl and any other
+Rust consumer behave the same way.
 
 ## OAuth test mode
 

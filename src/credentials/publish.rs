@@ -13,10 +13,13 @@
 //!
 //! The write is deliberately narrow:
 //!
-//! - only when the file still holds **exactly the refresh token that was just
-//!   spent** (a Claude Code that rotated on its own is never clobbered), and a
-//!   file that already holds the new token is left alone (no pointless mtime
-//!   bump);
+//! - [`publish_native_rotation`]: only when the file still holds **exactly
+//!   the refresh token that was just spent** (a Claude Code that rotated on
+//!   its own is never clobbered); [`publish_native_login`] (publish by
+//!   account, `super::link`): also when Claude Code is logged into the same
+//!   account (`.claude.json`) and its copy is older, since a newer login
+//!   revokes an older one; never for a different account. A file that
+//!   already holds the new token is left alone (no pointless mtime bump);
 //! - never creates the file, never follows a symlink, never overwrites a file
 //!   it cannot parse (it may be mid-write, and a clobbered file logs the user
 //!   out of Claude Code);
@@ -126,8 +129,13 @@ pub enum NativePublishOutcome {
     /// The file already holds the rotated token; nothing was written.
     Unchanged,
     /// The file holds some other credential (Claude Code rotated on its own,
-    /// or it is a different login); left alone.
+    /// a newer login of the same account, or an unidentified login); left
+    /// alone.
     NotHeld,
+    /// Claude Code is logged into a different account (its `.claude.json`
+    /// `oauthAccount` names another account or organization); never
+    /// written.
+    OtherAccount,
     /// There is no file (no Claude Code install, or a keychain-backed one);
     /// it is never created.
     Absent,
@@ -144,13 +152,15 @@ pub enum NativePublishOutcome {
 }
 
 impl NativePublishOutcome {
-    /// A stable wire code (`written`, `unchanged`, `not_held`, `absent`,
-    /// `unparseable`, `refused`, `lock_busy`, `failed`).
+    /// A stable wire code (`written`, `unchanged`, `not_held`,
+    /// `other_account`, `absent`, `unparseable`, `refused`, `lock_busy`,
+    /// `failed`).
     pub fn code(&self) -> &'static str {
         match self {
             Self::Written => "written",
             Self::Unchanged => "unchanged",
             Self::NotHeld => "not_held",
+            Self::OtherAccount => "other_account",
             Self::Absent => "absent",
             Self::Unparseable => "unparseable",
             Self::Refused(_) => "refused",
@@ -168,6 +178,67 @@ pub fn publish_native_rotation(
     spent: &RefreshToken,
     rotated: &OAuthTokens,
 ) -> NativePublishOutcome {
+    publish_with(path, rotated, &|held, _| {
+        if held == Some(spent.expose()) {
+            Verdict::Write
+        } else {
+            Verdict::Skip(NativePublishOutcome::NotHeld)
+        }
+    })
+}
+
+/// Publish by account (one login per account, `super::link`): write
+/// `rotated` into Claude Code's credential file when it holds `spent`
+/// (when given), **or** when Claude Code is logged into the same account
+/// as `rotated` (`.claude.json` `oauthAccount.{accountUuid,
+/// organizationUuid}` equal to `rotated`'s account and organization) and
+/// the file's copy is older (its access token expires before `rotated`'s),
+/// even though it holds a different refresh token: a newer login of an
+/// account revokes the older one, so that token is dead. A copy that is not
+/// older is a newer Claude Code login and is left alone
+/// ([`NativePublishOutcome::NotHeld`]); a file of a different account is
+/// never written ([`NativePublishOutcome::OtherAccount`]).
+/// Every other rule of [`publish_native_rotation`] holds (never created,
+/// no symlinks, unparseable refused, unknown keys kept, `0600` atomic
+/// replace under Claude Code's `.storage-write.lock`, the decision re-made
+/// under the lock).
+pub fn publish_native_login(
+    files: &super::link::ClaudeCodeFiles,
+    spent: Option<&RefreshToken>,
+    rotated: &OAuthTokens,
+) -> NativePublishOutcome {
+    let target = super::link::ClaudeCodeIdentity::of_tokens(rotated);
+    publish_with(&files.credentials, rotated, &|held, held_expires_at| {
+        if held.is_some() && spent.is_some_and(|spent| held == Some(spent.expose())) {
+            return Verdict::Write;
+        }
+        let Some(target) = &target else {
+            return Verdict::Skip(NativePublishOutcome::NotHeld);
+        };
+        match super::link::read_claude_code_identity(&files.config) {
+            Some(native) if native.same_account(target) => {
+                if held_expires_at.is_some_and(|at| at >= rotated.expires_at.timestamp_millis()) {
+                    Verdict::Skip(NativePublishOutcome::NotHeld)
+                } else {
+                    Verdict::Write
+                }
+            }
+            Some(_) => Verdict::Skip(NativePublishOutcome::OtherAccount),
+            None => Verdict::Skip(NativePublishOutcome::NotHeld),
+        }
+    })
+}
+
+enum Verdict {
+    Write,
+    Skip(NativePublishOutcome),
+}
+
+fn publish_with(
+    path: &Path,
+    rotated: &OAuthTokens,
+    decide: &dyn Fn(Option<&str>, Option<i64>) -> Verdict,
+) -> NativePublishOutcome {
     match std::fs::symlink_metadata(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return NativePublishOutcome::Absent;
@@ -183,9 +254,9 @@ pub fn publish_native_rotation(
         }
         Ok(_) => {}
     }
-    // Decide without the lock first: a file that does not hold the spent
-    // token (the common case) is never locked, only read.
-    match prepare(path, spent, rotated) {
+    // Decide without the lock first: a file that is not to be written (the
+    // common case) is never locked, only read.
+    match prepare(path, rotated, decide) {
         Prepared::Write(_) => {}
         Prepared::Done(outcome) => return outcome,
     }
@@ -194,7 +265,7 @@ pub fn publish_native_rotation(
         return NativePublishOutcome::LockBusy;
     };
     // Re-read under Claude Code's write lock: it may have written meanwhile.
-    match prepare(path, spent, rotated) {
+    match prepare(path, rotated, decide) {
         Prepared::Write(bytes) => match write_replace_private(path, &bytes) {
             Ok(()) => NativePublishOutcome::Written,
             Err(error) => NativePublishOutcome::Failed(io_message(&error)),
@@ -210,7 +281,11 @@ enum Prepared {
     Done(NativePublishOutcome),
 }
 
-fn prepare(path: &Path, spent: &RefreshToken, rotated: &OAuthTokens) -> Prepared {
+fn prepare(
+    path: &Path,
+    rotated: &OAuthTokens,
+    decide: &dyn Fn(Option<&str>, Option<i64>) -> Verdict,
+) -> Prepared {
     use Prepared::Done;
     let raw = match crate::file_security::read_bounded_regular(
         path,
@@ -251,8 +326,9 @@ fn prepare(path: &Path, spent: &RefreshToken, rotated: &OAuthTokens) -> Prepared
     if held == Some(rotated.refresh.expose()) {
         return Done(NativePublishOutcome::Unchanged);
     }
-    if held != Some(spent.expose()) {
-        return Done(NativePublishOutcome::NotHeld);
+    let held_expires_at = oauth.get("expiresAt").and_then(Value::as_i64);
+    if let Verdict::Skip(outcome) = decide(held, held_expires_at) {
+        return Done(outcome);
     }
     oauth.insert(
         "accessToken".into(),
@@ -331,25 +407,42 @@ fn write_replace_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Claude Code's `proper-lockfile` credential-write lock: a directory created
-/// with `mkdir` (atomic), treated as abandoned once its mtime is older than
-/// [`NATIVE_WRITE_LOCK_STALE`], removed on release.
-struct NativeWriteLock {
+/// Claude Code's `proper-lockfile` credential-write lock (see
+/// [`ProperLock`]) on `<config dir>/.storage-write.lock`.
+pub(crate) struct NativeWriteLock;
+
+impl NativeWriteLock {
+    pub(crate) fn acquire(config_directory: &Path) -> Option<ProperLock> {
+        ProperLock::acquire(
+            &config_directory.join(NATIVE_WRITE_LOCK_NAME),
+            NATIVE_WRITE_LOCK_STALE,
+        )
+    }
+}
+
+/// A `proper-lockfile` lock: a directory created with `mkdir` (atomic),
+/// treated as abandoned once its mtime is older than `stale`, removed on
+/// release. Retries 10 times, waiting 100 ms doubling to 1 s (about 7 s in
+/// all).
+pub(crate) struct ProperLock {
     path: PathBuf,
 }
 
-impl NativeWriteLock {
-    fn acquire(config_directory: &Path) -> Option<Self> {
-        let path = config_directory.join(NATIVE_WRITE_LOCK_NAME);
+impl ProperLock {
+    pub(crate) fn acquire(path: &Path, stale: Duration) -> Option<Self> {
         let mut wait = LOCK_MIN_WAIT;
         for attempt in 0..=LOCK_RETRIES {
-            match std::fs::create_dir(&path) {
-                Ok(()) => return Some(Self { path }),
+            match std::fs::create_dir(path) {
+                Ok(()) => {
+                    return Some(Self {
+                        path: path.to_path_buf(),
+                    });
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if lock_is_stale(&path) {
+                    if lock_is_stale(path, stale) {
                         // A dead holder: take it over the way proper-lockfile
                         // does (remove, then compete for mkdir again).
-                        let _ = std::fs::remove_dir(&path);
+                        let _ = std::fs::remove_dir(path);
                         continue;
                     }
                 }
@@ -365,18 +458,18 @@ impl NativeWriteLock {
     }
 }
 
-impl Drop for NativeWriteLock {
+impl Drop for ProperLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir(&self.path);
     }
 }
 
-fn lock_is_stale(path: &Path) -> bool {
+fn lock_is_stale(path: &Path, stale: Duration) -> bool {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
-        .is_some_and(|age| age > NATIVE_WRITE_LOCK_STALE)
+        .is_some_and(|age| age > stale)
 }
 
 /// Non-secret facts about Claude Code's credential file (for an explicit

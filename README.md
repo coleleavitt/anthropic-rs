@@ -77,14 +77,37 @@ Store safety properties, each covered by a test:
   days) or that have no access token, behind a store-level lease. Nothing else
   rotates idle accounts.
 
-- **Claude Code's login is kept alive** — after a rotation it committed,
-  `refresh_shared` publishes the new token pair to Claude Code's
-  `.credentials.json` when (and only when) that file still holds the spent
-  refresh token: never created, never through a symlink, never over an
-  unparseable file, unknown keys kept, `0600` + rename, under Claude Code's
-  own `.storage-write.lock`. `OAuthClient::native_publish`
+- **One login per account, shared with Claude Code** — logging into an
+  Anthropic account revokes that account's older login, so a store row and
+  Claude Code cannot each hold their own. A row is *linked* when its account
+  uuid and organization uuid equal Claude Code's `.claude.json`
+  `oauthAccount.{accountUuid, organizationUuid}` (`$CLAUDE_CONFIG_DIR/.claude.json`,
+  else `~/.claude.json`; without one, the identity of a row holding Claude
+  Code's exact token; never a network call). For a linked row
+  (`credentials::reconcile_claude_code_link`), the newest copy wins: Claude
+  Code's newer login is **adopted** into the row (id, label, quota and unknown
+  fields kept; error and dead verdict cleared — they belonged to the revoked
+  token), and the store's newer one is **published** to Claude Code. While
+  Claude Code's access token is live it is **borrowed**
+  (`RefreshSource::ClaudeCode`, `AccessSource::ClaudeCode`) and nothing is
+  refreshed; when it has expired the store refreshes once under Claude
+  Code's own refresh lock (`<config dir>/.oauth_refresh.lock` plus the legacy
+  `<config dir>.lock`) and publishes the rotation. An `invalid_grant` on a
+  linked row re-reads Claude Code first and heals by adopting its newer login
+  instead of marking the account dead. The keep-alive skips linked rows while
+  Claude Code's token is live.
+- **Publish by account** — after a rotation (or a new login) the new pair is
+  written to Claude Code's `.credentials.json` when it holds the spent token,
+  or when Claude Code is logged into the same account with an older copy
+  (`credentials::publish_native_login`); never for another account
+  (`other_account`), never over a newer Claude Code login. The file is never
+  created, never written through a symlink or over an unparseable file;
+  unknown keys are kept; `0600` + rename, under Claude Code's
+  `.storage-write.lock`, decided again under the lock. The link and the
+  publish follow `OAuthClient::native_publish`
   (`NativePublish::{Off, Auto, At(path)}`); default `Auto` unless
-  `ANTHROPIC_NATIVE_PUBLISH=0`; `Auto` is suppressed in OAuth test mode.
+  `ANTHROPIC_NATIVE_PUBLISH=0` (which turns the whole link off); `Auto` is
+  suppressed in OAuth test mode.
 - **Revoke is claimed** — `OAuthClient::revoke_account` claims the row,
   revokes the refresh token, and only then removes or disables the row.
 - **API-key rows** — `AccountStore::add_api_key` / `access::get_api_key`.
@@ -94,8 +117,9 @@ Store safety properties, each covered by a test:
   unidentified rows from the profile endpoint with a live access token only.
 
 `access::get_access_token` is the coarse entry point for hosts: selection
-(pin first, allowlist, quota reserve), refresh, adoption and rotation past a
-failing login, returning an access token and non-secret metadata only.
+(pin first, allowlist, quota reserve), the Claude Code link, refresh,
+adoption and rotation past a failing login, returning an access token and
+non-secret metadata only.
 
 ## Account rotation
 
@@ -180,7 +204,10 @@ their own token custody. The API is coarse and asynchronous
 allowlist, reservePct })`, `markRateLimited`, `recordQuota`,
 `recordQuotaHeaders`, `markUsed`, `setAccountEnabled`, `removeAccount`,
 `reorderAccounts`, `setCurrent`, `keepAliveOnce`, `startLogin` /
-`completeLogin` (PKCE; the verifier and the code exchange stay in Rust),
+`completeLogin` (PKCE; the verifier and the code exchange stay in Rust; a
+login of the account Claude Code is logged into warns and is published to
+Claude Code), `importNativeClaudeAccount` (links the store to Claude Code's
+login),
 `importOAuthAccount` (one-way migration into the store) and
 `handleUnauthorized` (one claimed refresh after a 401). **Refresh tokens never
 cross into JavaScript.** Errors are `AnthropicAuthError` with `code` one of

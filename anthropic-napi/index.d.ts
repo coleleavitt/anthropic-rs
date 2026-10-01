@@ -119,6 +119,23 @@ export interface AccountInfo {
   scopes: string[]
   /** `api_key` rows: the key's last four characters (never the key). */
   apiKeySuffix?: string
+  /**
+   * The row is the account Claude Code is logged into (same account and
+   * organization): one login, shared and kept in step both ways.
+   */
+  claudeCodeLinked: boolean
+  /**
+   * `completeLogin` only: what publishing the new login to Claude Code's
+   * credential file did (`written`, `unchanged`, `not_held`, `other_account`,
+   * `absent`, `unparseable`, `refused`, `lock_busy`, `failed`).
+   */
+  claudeCodePublish?: string
+  /**
+   * `completeLogin` only: a notice for the user. A login of the account Claude
+   * Code is logged into replaces Claude Code's login (Anthropic revokes the
+   * older one).
+   */
+  warning?: string
 }
 
 export interface GetAccessTokenOptions {
@@ -136,7 +153,11 @@ export interface AccessToken {
   accountId: string
   email?: string
   expiresAt: number
-  source: 'store' | 'refreshed' | 'adopted'
+  /**
+   * `claude_code`: the account is linked to Claude Code's login and its live
+   * access token was borrowed (nothing was refreshed).
+   */
+  source: 'store' | 'refreshed' | 'adopted' | 'claude_code'
 }
 
 export interface MarkRateLimitedOptions {
@@ -178,7 +199,8 @@ export interface KeepAliveEntry {
    * failed: `invalid_grant` | `transient`;
    * skipped: `disabled` | `not_oauth` | `no_refresh_token` | `dead_token` |
    * `refresh_expired` | `in_use` | `session_live` | `recently_refreshed` |
-   * `not_due` | `deferred`.
+   * `not_due` | `deferred` | `claude_code_live` (linked to Claude Code's
+   * login, whose access token is live: Claude Code keeps it alive).
    */
   reason: string
   message?: string
@@ -241,9 +263,11 @@ export interface ImportResult {
   accountId: string
   /**
    * `added`: new row; `already_present`: the store holds this exact token;
-   * `kept`: the store already holds this login with its own token (the store wins).
+   * `kept`: the store already holds this login with its own token (the store wins);
+   * `linked` (`importNativeClaudeAccount` when Claude Code's account is known):
+   * the row now shares Claude Code's login, newest copy winning.
    */
-  status: 'added' | 'already_present' | 'kept'
+  status: 'added' | 'already_present' | 'kept' | 'linked'
 }
 
 export interface HandleUnauthorizedOptions {
@@ -342,6 +366,12 @@ export interface NativeClaudeInfo {
   rateLimitTier?: string
   /** The store row holding the same refresh token (its refreshes are published back). */
   storeAccountId?: string
+  /** The account Claude Code is logged into (`.claude.json` `oauthAccount`), when known. */
+  accountUuid?: string
+  organizationUuid?: string
+  email?: string
+  /** The store row linked to Claude Code's login (same account and organization). */
+  linkedAccountId?: string
 }
 
 /** A handle on one shared store. Safe to share; every method is independent. */

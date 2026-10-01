@@ -295,6 +295,121 @@ describe('native Claude Code publish', () => {
   })
 })
 
+// ---- one login per account (Claude Code link) ------------------------------
+describe('one login per account: the store and Claude Code share a linked login', () => {
+  const CC_ACCOUNT = 'acct-profile'
+  const CC_ORG = 'org-profile'
+  const NATIVE_REFRESH = 'sk-ant-ort01-claudecodeloginclaudecode00'
+  const NATIVE_ACCESS = 'sk-ant-oat01-claudecodeloginclaudecode00'
+
+  /** Claude Code logged into `account`: its credential file and `.claude.json`. */
+  function claudeCode(account: string, opts: { refresh?: string; access?: string; expiresIn?: number } = {}) {
+    const configDir = join(dir, 'claude-config')
+    mkdirSync(configDir, { recursive: true })
+    const path = join(configDir, '.credentials.json')
+    writeFileSync(
+      path,
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: opts.access ?? NATIVE_ACCESS,
+          refreshToken: opts.refresh ?? NATIVE_REFRESH,
+          expiresAt: Date.now() + (opts.expiresIn ?? 6 * HOUR),
+          scopes: ['user:inference', 'user:profile'],
+          subscriptionType: 'max',
+        },
+        mcpOAuth: { server: { keep: true } },
+      }),
+      { mode: 0o600 },
+    )
+    writeFileSync(
+      join(configDir, '.claude.json'),
+      JSON.stringify({
+        projects: {},
+        oauthAccount: { accountUuid: account, organizationUuid: CC_ORG, emailAddress: 'me@example.com' },
+      }),
+      { mode: 0o600 },
+    )
+    return path
+  }
+
+  function linkedRow(id: string, extra: Record<string, unknown> = {}) {
+    const row: any = oauthRow(id)
+    row.credential.account = { uuid: CC_ACCOUNT, email_address: 'me@example.com' }
+    row.credential.organization = { uuid: CC_ORG }
+    row.label = 'Mine'
+    row.quota = { five_hour_percent: 10, seven_day_percent: 20, checked_at: new Date().toISOString() }
+    return { ...row, ...extra }
+  }
+
+  test("Claude Code's live token is borrowed; the store refreshes nothing", async () => {
+    seed([linkedRow('mine')])
+    const native = claudeCode(CC_ACCOUNT)
+    const before = readFileSync(native)
+    const a = new AnthropicAuth({ storePath, tokenUrl, nativeCredentialsPath: native })
+    const token = await a.getAccessToken()
+    expect(token).toMatchObject({ accountId: 'mine', accessToken: NATIVE_ACCESS, source: 'claude_code' })
+    expect(presented).toEqual([])
+    // Synced both ways: the row holds the shared login, the file is untouched.
+    expect(readStore().accounts[0].credential.refresh).toBe(NATIVE_REFRESH)
+    expect(readFileSync(native).equals(before)).toBe(true)
+    const [row] = await a.listAccounts()
+    expect(row).toMatchObject({ id: 'mine', claudeCodeLinked: true, label: 'Mine' })
+    expect(JSON.stringify(row)).not.toContain('sk-ant-')
+  })
+
+  test('a login of the account Claude Code is logged into warns and is published to it', async () => {
+    const native = claudeCode(CC_ACCOUNT, { refresh: 'sk-ant-ort01-oldcclogin-oldccloginold00', expiresIn: HOUR })
+    const a = new AnthropicAuth({ storePath, tokenUrl, profileUrl, nativeCredentialsPath: native })
+    const login = a.startLogin()
+    const info = await a.completeLogin({ loginId: login.loginId, callback: `anon-code#${login.state}` })
+    expect(info).toMatchObject({ accountUuid: CC_ACCOUNT, claudeCodeLinked: true, claudeCodePublish: 'written' })
+    expect(info.warning).toContain("replaces Claude Code's")
+    expect(JSON.stringify(info)).not.toContain('sk-ant-')
+    const doc = readJson(native)
+    expect(doc.claudeAiOauth.refreshToken).toBe('sk-ant-ort01-exchangedexchangedexchang00')
+    expect(doc.claudeAiOauth.subscriptionType).toBe('max')
+    expect(doc.mcpOAuth).toEqual({ server: { keep: true } })
+  })
+
+  test('a login of another account never touches Claude Code', async () => {
+    const native = claudeCode('acct-someone-else')
+    const before = readFileSync(native)
+    const a = new AnthropicAuth({ storePath, tokenUrl, profileUrl, nativeCredentialsPath: native })
+    const login = a.startLogin()
+    const info = await a.completeLogin({ loginId: login.loginId, callback: `anon-code#${login.state}` })
+    expect(info.warning).toBeUndefined()
+    expect(info.claudeCodeLinked).toBe(false)
+    expect(readFileSync(native).equals(before)).toBe(true)
+  })
+
+  test('import-native links: a newer Claude Code login heals the revoked row in place', async () => {
+    seed([
+      linkedRow('mine', {
+        last_error: 'invalid_grant',
+        dead_refresh_fingerprint: 'x',
+      }),
+    ])
+    const native = claudeCode(CC_ACCOUNT)
+    const a = new AnthropicAuth({ storePath, tokenUrl, nativeCredentialsPath: native })
+    const info = await a.readNativeClaudeOAuth()
+    expect(info).toMatchObject({ accountUuid: CC_ACCOUNT, organizationUuid: CC_ORG, linkedAccountId: 'mine' })
+    expect(JSON.stringify(info)).not.toContain('sk-ant-')
+    expect(await a.importNativeClaudeAccount()).toEqual({ accountId: 'mine', status: 'linked' })
+    const row = readStore().accounts[0]
+    expect(row.id).toBe('mine')
+    expect(row.label).toBe('Mine')
+    expect(row.quota.seven_day_percent).toBe(20)
+    expect(row.credential.refresh).toBe(NATIVE_REFRESH)
+    expect(row.last_error).toBeUndefined()
+    expect(row.dead_refresh_fingerprint).toBeUndefined()
+    expect(presented).toEqual([])
+    // No row of that account yet: a new row is created holding the login.
+    seed([oauthRow('other', { refresh: 'sk-ant-ort01-otherotherotherotherot00' })])
+    expect(await a.importNativeClaudeAccount({ label: 'CC' })).toEqual({ accountId: 'CC', status: 'linked' })
+    expect(readStore().accounts.map((r: any) => r.id)).toEqual(['other', 'CC'])
+  })
+})
+
 // ---- revoke ----------------------------------------------------------------
 describe('revokeAccount', () => {
   test('revokes at the (mock) revoke URL, then removes or disables the row', async () => {

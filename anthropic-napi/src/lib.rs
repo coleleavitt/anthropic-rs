@@ -24,7 +24,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use anthropic::access::{AccessErrorKind, AccessRequest, AccessSource};
+use anthropic::access::{AccessErrorKind, AccessRequest};
+use anthropic::credentials::{ClaudeCodeFiles, NativePublishOutcome};
 use anthropic::keepalive::{
     KeepAliveLeaseOutcome,
     KeepAliveOptions,
@@ -192,9 +193,24 @@ pub struct AccountInfo {
     pub scopes: Vec<String>,
     /// For `api_key` rows: the key's last four characters (never the key).
     pub api_key_suffix: Option<String>,
+    /// The row is the account Claude Code is logged into (same account and
+    /// organization): the two share one login, kept in step both ways.
+    pub claude_code_linked: bool,
+    /// `completeLogin` only: what publishing the new login to Claude Code's
+    /// credential file did (`written`, `unchanged`, `not_held`,
+    /// `other_account`, `absent`, …); absent when nothing was attempted.
+    pub claude_code_publish: Option<String>,
+    /// `completeLogin` only: a notice for the user (a login of the account
+    /// Claude Code is logged into replaces Claude Code's login).
+    pub warning: Option<String>,
 }
 
-fn account_info(store: &AccountStore, account: &Account, now: DateTime<Utc>) -> AccountInfo {
+fn account_info(
+    store: &AccountStore,
+    account: &Account,
+    now: DateTime<Utc>,
+    login: Option<&anthropic::credentials::ClaudeCodeLogin>,
+) -> AccountInfo {
     let tokens = account.oauth();
     AccountInfo {
         id: account.id.clone(),
@@ -234,6 +250,10 @@ fn account_info(store: &AccountStore, account: &Account, now: DateTime<Utc>) -> 
             Credential::ApiKey { key } => Some(token::key_suffix(key.expose())),
             Credential::Oauth(_) => None,
         },
+        claude_code_linked: login
+            .is_some_and(|login| anthropic::credentials::is_linked(account, &login.identity)),
+        claude_code_publish: None,
+        warning: None,
     }
 }
 
@@ -261,7 +281,9 @@ pub struct AccessToken {
     pub email: Option<String>,
     /// Access-token expiry (epoch ms).
     pub expires_at: i64,
-    /// `"store"`, `"refreshed"` or `"adopted"`.
+    /// `"store"`, `"refreshed"`, `"adopted"` or `"claude_code"` (the
+    /// account is linked to Claude Code's login and its live access token
+    /// was borrowed; nothing was refreshed).
     pub source: String,
 }
 
@@ -271,12 +293,7 @@ fn access_token_of(grant: anthropic::access::AccessGrant) -> AccessToken {
         account_id: grant.account_id,
         email: grant.email,
         expires_at: ms(grant.expires_at),
-        source: match grant.source {
-            AccessSource::Store => "store",
-            AccessSource::Refreshed => "refreshed",
-            AccessSource::Adopted => "adopted",
-        }
-        .into(),
+        source: grant.source.code().into(),
     }
 }
 
@@ -584,6 +601,16 @@ pub struct NativeClaudeInfo {
     /// The store row holding the same refresh token, when there is one
     /// (then a store refresh is published back to this file).
     pub store_account_id: Option<String>,
+    /// The account Claude Code is logged into (`.claude.json`
+    /// `oauthAccount`, else a row holding its exact token), when known.
+    pub account_uuid: Option<String>,
+    /// Its organization.
+    pub organization_uuid: Option<String>,
+    /// Its email (display only).
+    pub email: Option<String>,
+    /// The store row linked to Claude Code's login (same account and
+    /// organization): the two share one login, kept in step both ways.
+    pub linked_account_id: Option<String>,
 }
 
 struct PendingLogin {
@@ -616,6 +643,13 @@ impl AnthropicAuth {
         OAuthClient::new(self.endpoints.clone())
             .require_loopback(self.test_mode)
             .native_publish(self.native_publish.clone())
+    }
+
+    /// Claude Code's files for the one-login-per-account link: the
+    /// configured native file while the native publish is on (never in OAuth
+    /// test mode without an explicit path).
+    fn claude_code_files(&self) -> Option<ClaudeCodeFiles> {
+        self.native_publish.files(self.test_mode())
     }
 
     /// Fold the configured legacy stores into the store (append-only,
@@ -837,15 +871,19 @@ impl AnthropicAuth {
     pub async fn list_accounts(&self) -> napi::Result<Vec<AccountInfo>> {
         self.adopt_legacy().await?;
         let path = self.path.clone();
+        let files = self.claude_code_files();
         blocking(move || {
             let store = AccountStore::load_or_migrate_from(&path, &[])
                 .map_err(|e| from_crate(&e))?
                 .store;
             let now = Utc::now();
+            let login = files
+                .as_ref()
+                .and_then(|f| anthropic::credentials::read_claude_code_login(f, Some(&store)));
             Ok(store
                 .accounts
                 .iter()
-                .map(|a| account_info(&store, a, now))
+                .map(|a| account_info(&store, a, now, login.as_ref()))
                 .collect())
         })
         .await
@@ -1167,6 +1205,10 @@ impl AnthropicAuth {
 
     /// Finish a login: verify the state, exchange the code, and store the
     /// account (updating the same login in place when it already exists).
+    /// A login of the account Claude Code is logged into replaces Claude
+    /// Code's login (an account has one login at a time): the new tokens are
+    /// published to Claude Code's credential file, and `warning` /
+    /// `claudeCodePublish` say so.
     #[napi]
     pub async fn complete_login(&self, options: CompleteLoginOptions) -> napi::Result<AccountInfo> {
         let tokens = self.exchange(&options.login_id, &options.callback).await?;
@@ -1179,7 +1221,52 @@ impl AnthropicAuth {
             .filter(|l| !l.is_empty());
         let set_current = options.set_current;
         let path = self.path.clone();
-        blocking(move || store_login(&path, tokens, label, set_current)).await
+        let files = self.claude_code_files();
+        blocking(move || {
+            let mut info = store_login(&path, tokens, label, set_current, files.as_ref())?;
+            // One login per account: a login of the account Claude Code is
+            // logged into revokes Claude Code's, so the new one is published
+            // to Claude Code's file (by account, never another account's).
+            let Some(files) = files else {
+                return Ok(info);
+            };
+            let row = AccountStore::load_or_migrate_from(&path, &[])
+                .ok()
+                .and_then(|l| l.store.get(&info.id).and_then(|a| a.oauth().cloned()));
+            let (Some(row), Some(native)) = (
+                row,
+                anthropic::credentials::read_claude_code_identity(&files.config),
+            ) else {
+                return Ok(info);
+            };
+            if !anthropic::credentials::ClaudeCodeIdentity::of_tokens(&row)
+                .is_some_and(|login| login.same_account(&native))
+            {
+                return Ok(info);
+            }
+            let outcome = anthropic::credentials::publish_native_login(&files, None, &row);
+            let who = native
+                .email
+                .as_deref()
+                .or(info.email.as_deref())
+                .unwrap_or("this account");
+            let effect = match outcome {
+                NativePublishOutcome::Written | NativePublishOutcome::Unchanged => {
+                    "Claude Code's credential file now holds this login, so Claude Code keeps working".to_owned()
+                }
+                ref other => format!(
+                    "Claude Code's credential file could not be updated ({}); log Claude Code in again or run import-native",
+                    other.code()
+                ),
+            };
+            info.claude_code_linked = true;
+            info.claude_code_publish = Some(outcome.code().into());
+            info.warning = Some(format!(
+                "Claude Code is logged into {who}. An account has one login at a time: this login replaces Claude Code's, which Anthropic revokes. {effect}."
+            ));
+            Ok(info)
+        })
+        .await
     }
 
     /// Move an OAuth credential a host still holds into the store (one-time
@@ -1390,21 +1477,31 @@ impl AnthropicAuth {
             else {
                 return Ok(None);
             };
-            let store_account_id = AccountStore::load_or_migrate_from(&path, &[])
+            let store = AccountStore::load_or_migrate_from(&path, &[])
                 .ok()
-                .and_then(|loaded| {
-                    loaded
-                        .store
-                        .accounts
-                        .iter()
-                        .find(|a| {
-                            a.oauth().is_some_and(|t| {
-                                token::token_fingerprint(t.refresh.expose())
-                                    == summary.refresh_fingerprint
-                            })
+                .map(|loaded| loaded.store);
+            let store_account_id = store.as_ref().and_then(|store| {
+                store
+                    .accounts
+                    .iter()
+                    .find(|a| {
+                        a.oauth().is_some_and(|t| {
+                            token::token_fingerprint(t.refresh.expose())
+                                == summary.refresh_fingerprint
                         })
-                        .map(|a| a.id.clone())
-                });
+                    })
+                    .map(|a| a.id.clone())
+            });
+            let login = anthropic::credentials::read_claude_code_login(
+                &ClaudeCodeFiles::for_credentials(&file),
+                store.as_ref(),
+            );
+            let identity = login.as_ref().map(|l| l.identity.clone());
+            let linked_account_id = login.as_ref().and_then(|login| {
+                store.as_ref()?.accounts.iter().find_map(|a| {
+                    anthropic::credentials::is_linked(a, &login.identity).then(|| a.id.clone())
+                })
+            });
             Ok(Some(NativeClaudeInfo {
                 path: summary.path.to_string_lossy().into_owned(),
                 expires_at: summary.expires_at,
@@ -1413,17 +1510,27 @@ impl AnthropicAuth {
                 subscription_type: summary.subscription_type,
                 rate_limit_tier: summary.rate_limit_tier,
                 store_account_id,
+                account_uuid: identity.as_ref().map(|i| i.account_uuid.clone()),
+                organization_uuid: identity.as_ref().map(|i| i.organization_uuid.clone()),
+                email: identity.and_then(|i| i.email),
+                linked_account_id,
             }))
         })
         .await
     }
 
-    /// Import the credential Claude Code holds in its credential file into
-    /// the store (the tokens never reach JavaScript). The store's copy of the
-    /// same login wins. From then on a store refresh of that token is
-    /// published back to the file, so Claude Code's login stays alive.
-    /// Rejects `auth_required` when there is no file (or, in OAuth test
-    /// mode, no explicit path).
+    /// Link the store to Claude Code's login (one login per account; the
+    /// tokens never reach JavaScript). When Claude Code's `.claude.json`
+    /// names its account, the row of that account is brought into step with
+    /// it, newest copy winning (Claude Code's newer login is adopted, keeping
+    /// the row's id, label and quota; a newer store login is published to
+    /// Claude Code), or a new row is created holding it: status `linked`.
+    /// From then on the store borrows Claude Code's live access token,
+    /// refreshes only under Claude Code's refresh lock, and publishes every
+    /// rotation back. Without an identity it falls back to the one-time copy
+    /// (`added` / `already_present` / `kept`; the store's copy of the same
+    /// login wins). Rejects `auth_required` when there is no file (or, in
+    /// OAuth test mode, no explicit path).
     #[napi]
     pub async fn import_native_claude_account(
         &self,
@@ -1436,7 +1543,14 @@ impl AnthropicAuth {
                 "no Claude Code credential file to import (OAuth test mode reads only an explicit path)",
             ));
         };
-        let imported = blocking(move || {
+        let label = options
+            .label
+            .map(|l| l.trim().to_owned())
+            .filter(|l| !l.is_empty())
+            .or_else(|| Some("Claude Code".to_owned()));
+        let path = self.path.clone();
+        let link_label = label.clone();
+        let linked = blocking(move || {
             match std::fs::symlink_metadata(&file) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     return Err(fail(
@@ -1446,19 +1560,22 @@ impl AnthropicAuth {
                 }
                 _ => {}
             }
-            anthropic::import_native_claude_file(Some(&file)).map_err(|e| native_error(&e))
+            let imported =
+                anthropic::import_native_claude_file(Some(&file)).map_err(|e| native_error(&e))?;
+            link_claude_code(&path, &file, link_label).map(|linked| (linked, imported))
         })
         .await?;
+        let imported = match linked {
+            (Some(result), _) => return Ok(result),
+            (None, imported) => imported,
+        };
+        // No identity for Claude Code's login (no `.claude.json`
+        // `oauthAccount`, and no row holding its token): the one-time copy.
         let tokens = if imported.tokens.expires_at > Utc::now() {
             self.identify(imported.tokens).await
         } else {
             imported.tokens
         };
-        let label = options
-            .label
-            .map(|l| l.trim().to_owned())
-            .filter(|l| !l.is_empty())
-            .or_else(|| Some("Claude Code".to_owned()));
         self.import_tokens(tokens, label, None).await
     }
 
@@ -1616,6 +1733,58 @@ impl AnthropicAuth {
     }
 }
 
+/// `importNativeClaudeAccount` as a link (one login per account): when
+/// Claude Code's login names its account, the row of that account is
+/// brought into step with it (Claude Code's newer login adopted, or the
+/// store's newer one published), or a new row is created holding it.
+/// `Ok(None)` when Claude Code's login has no identity.
+fn link_claude_code(
+    path: &std::path::Path,
+    credentials: &std::path::Path,
+    label: Option<String>,
+) -> napi::Result<Option<ImportResult>> {
+    let files = ClaudeCodeFiles::for_credentials(credentials);
+    let store = match AccountStore::load_or_migrate_from(path, &[]) {
+        Ok(loaded) => loaded.store,
+        Err(anthropic::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            AccountStore::default()
+        }
+        Err(e) => return Err(from_crate(&e)),
+    };
+    let Some(login) = anthropic::credentials::read_claude_code_login(&files, Some(&store)) else {
+        return Ok(None);
+    };
+    if let Some(row) = store
+        .accounts
+        .iter()
+        .find(|a| anthropic::credentials::is_linked(a, &login.identity))
+    {
+        anthropic::credentials::reconcile_claude_code_link(path, &files, &row.id)
+            .map_err(|e| from_crate(&e))?;
+        return Ok(Some(ImportResult {
+            account_id: row.id.clone(),
+            status: "linked".into(),
+        }));
+    }
+    let email = login.identity.email.clone();
+    let id = AccountStore::mutate(path, |store| {
+        let id = preferred_id(store, &login.tokens, label.as_deref());
+        let mut account = Account::new(id, Credential::Oauth(login.tokens.clone()));
+        account.label = label.clone();
+        account.email = email.clone();
+        let id = store.merge_login(account)?;
+        if store.current.is_none() {
+            store.current = Some(id.clone());
+        }
+        Ok(id)
+    })
+    .map_err(|e| from_crate(&e))?;
+    Ok(Some(ImportResult {
+        account_id: id,
+        status: "linked".into(),
+    }))
+}
+
 fn config_error(message: &str) -> napi::Error {
     config(message)
 }
@@ -1656,6 +1825,7 @@ fn skip_code(skip: KeepAliveSkip) -> &'static str {
         KeepAliveSkip::RecentlyRefreshed => "recently_refreshed",
         KeepAliveSkip::NotDue => "not_due",
         KeepAliveSkip::Deferred => "deferred",
+        KeepAliveSkip::ClaudeCodeLive => "claude_code_live",
     }
 }
 
@@ -1729,6 +1899,7 @@ fn store_login(
     tokens: OAuthTokens,
     label: Option<String>,
     set_current: Option<bool>,
+    files: Option<&ClaudeCodeFiles>,
 ) -> napi::Result<AccountInfo> {
     AccountStore::mutate(path, |store| {
         let id = preferred_id(store, &tokens, label.as_deref());
@@ -1739,9 +1910,11 @@ fn store_login(
             store.current = Some(id.clone());
         }
         let now = Utc::now();
+        let login =
+            files.and_then(|f| anthropic::credentials::read_claude_code_login(f, Some(store)));
         store
             .get(&id)
-            .map(|a| account_info(store, a, now))
+            .map(|a| account_info(store, a, now, login.as_ref()))
             .ok_or(anthropic::Error::UnknownAccount(id))
     })
     .map_err(|e| from_crate(&e))

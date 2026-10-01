@@ -37,11 +37,22 @@
 //!    discarded. A lost race adopts the winner's session when it is usable
 //!    and refuses otherwise. The lease is released on every path.
 //! 7. After a rotation this call performed, Claude Code's credential file is
-//!    brought forward when it still holds the spent token
-//!    ([`OAuthClient::native_publish`],
-//!    [`crate::credentials::publish_native_rotation`]). The rotation is
+//!    brought forward when it still holds the spent token or Claude Code is
+//!    logged into the same account ([`OAuthClient::native_publish`],
+//!    [`crate::credentials::publish_native_login`]). The rotation is
 //!    already committed; a failed publish never fails the refresh and is
 //!    reported on [`SharedRefreshOutcome::native_publish`].
+//! 8. One login per account ([`crate::credentials::reconcile_claude_code_link`]):
+//!    a row linked to Claude Code's login (same account and organization)
+//!    is first brought into step with it, newest copy winning. While Claude
+//!    Code's access token is live it is borrowed and nothing is spent
+//!    ([`RefreshSource::ClaudeCode`]). Otherwise the shared token is
+//!    refreshed once, under Claude Code's own refresh lock
+//!    ([`crate::credentials::ClaudeCodeRefreshLock`]), and published back.
+//!    An `invalid_grant` on a linked row first re-reads Claude Code's
+//!    login: a newer one (the operator logged in there, revoking the
+//!    store's) is adopted, which clears the error and the dead verdict,
+//!    instead of the account being declared dead.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -49,7 +60,7 @@ use std::sync::{Mutex, OnceLock};
 
 use chrono::{Duration, Utc};
 
-use crate::credentials::NativePublishOutcome;
+use crate::credentials::{ClaudeCodeFiles, LinkReconcile, NativePublishOutcome};
 use crate::error::{Error, Result, RevocationOrigin};
 use crate::oauth::OAuthClient;
 use crate::refresh_claim::{REFRESH_LEASE_TTL_SECS, RefreshClaim};
@@ -72,6 +83,9 @@ pub enum RefreshSource {
     /// This caller refreshed but lost the commit race; the winner's session
     /// was adopted.
     AdoptedWinner,
+    /// The row is linked to Claude Code's login and Claude Code's live
+    /// access token was borrowed: nothing was spent.
+    ClaudeCode,
 }
 
 /// A credential obtained by [`OAuthClient::refresh_shared`].
@@ -276,6 +290,17 @@ impl OAuthClient {
         let located = AccountStore::read_locked(path, |store| Ok(locate(store, presented, now)))
             .map_err(|error| Error::RefreshRefused(format!("shared store unreadable: {error}")))?;
 
+        // One login per account: a row linked to Claude Code's login borrows,
+        // adopts or refreshes under Claude Code's refresh lock.
+        if let (Some(files), Located::Held { account_id, .. } | Located::Rotated { account_id, .. }) =
+            (self.claude_code_files(), &located)
+            && let Some(outcome) = self
+                .refresh_linked(path, &files, account_id, presented, options)
+                .await?
+        {
+            return Ok(outcome);
+        }
+
         let (account_id, spend) = match located {
             Located::Held { account_id, tokens } => (account_id, tokens),
             Located::Rotated {
@@ -339,13 +364,26 @@ impl OAuthClient {
             }
         };
 
+        self.claim_and_refresh(path, &account_id, &spend, options)
+            .await
+    }
+
+    /// Claim `account_id`'s refresh lease for `spend`, spend it once and
+    /// commit the rotation (steps 3–7 of the module docs).
+    async fn claim_and_refresh(
+        &self,
+        path: &Path,
+        account_id: &str,
+        spend: &OAuthTokens,
+        options: &SharedRefreshOptions,
+    ) -> Result<SharedRefreshOutcome> {
         // Claim first and re-read under the claim: the store CAS after the
         // network call is too late, both POSTs have already happened by then.
         let mut attempt = 0u32;
         let lease_id = loop {
             let claim = AccountStore::mutate(path, |store| {
                 Ok(store.claim_refresh(
-                    &account_id,
+                    account_id,
                     &spend.refresh,
                     Utc::now(),
                     Duration::seconds(options.lease_ttl_secs),
@@ -358,7 +396,7 @@ impl OAuthClient {
                     return Ok(SharedRefreshOutcome {
                         tokens,
                         source: RefreshSource::AdoptedPeer,
-                        account_id: Some(account_id),
+                        account_id: Some(account_id.to_owned()),
                         native_publish: None,
                     });
                 }
@@ -389,10 +427,10 @@ impl OAuthClient {
         };
 
         let result = self
-            .refresh_claimed(path, &account_id, &lease_id, &spend, options)
+            .refresh_claimed(path, account_id, &lease_id, spend, options)
             .await;
         if result.is_err() {
-            let _ = AccountStore::release_refresh_claim_at(path, &account_id, &lease_id);
+            let _ = AccountStore::release_refresh_claim_at(path, account_id, &lease_id);
         }
         result
     }
@@ -476,25 +514,154 @@ impl OAuthClient {
         })
     }
 
+    /// Claude Code's files for the link and the by-account publish (the
+    /// native-publish policy; `Auto` is suppressed in OAuth test mode).
+    pub fn claude_code_files(&self) -> Option<ClaudeCodeFiles> {
+        self.native_publish_policy().files(self.is_test_mode())
+    }
+
     /// Bring Claude Code's credential file forward after a rotation this
-    /// process committed (module docs, step 7). Blocking file work (Claude
-    /// Code's write lock may be waited on for a few seconds) runs off the
-    /// async worker.
+    /// process committed (module docs, step 7): when it holds the spent
+    /// token, or Claude Code is logged into the same account. Blocking file
+    /// work (Claude Code's write lock may be waited on for a few seconds)
+    /// runs off the async worker.
     async fn publish_native(
         &self,
         spent: &crate::token::RefreshToken,
         rotated: &OAuthTokens,
     ) -> Option<NativePublishOutcome> {
-        let path = self.native_publish_policy().target(self.is_test_mode())?;
+        let files = self.claude_code_files()?;
         let spent = spent.clone();
         let rotated = rotated.clone();
-        let work = move || crate::credentials::publish_native_rotation(&path, &spent, &rotated);
-        Some(match tokio::runtime::Handle::try_current() {
-            Ok(handle) => handle.spawn_blocking(work).await.unwrap_or_else(|e| {
+        Some(
+            off_thread(move || {
+                crate::credentials::publish_native_login(&files, Some(&spent), &rotated)
+            })
+            .await
+            .unwrap_or_else(|e| {
                 NativePublishOutcome::Failed(format!("publish worker failed: {e}"))
             }),
-            Err(_) => work(),
-        })
+        )
+    }
+
+    /// Module docs, step 8. `Ok(None)`: the row is not linked to Claude
+    /// Code's login; the ordinary path continues.
+    async fn refresh_linked(
+        &self,
+        path: &Path,
+        files: &ClaudeCodeFiles,
+        account_id: &str,
+        presented: &OAuthTokens,
+        options: &SharedRefreshOptions,
+    ) -> Result<Option<SharedRefreshOutcome>> {
+        let first = reconcile(path, files, account_id).await?;
+        if matches!(first, LinkReconcile::NotLinked) {
+            return Ok(None);
+        }
+        if let Some(outcome) = borrowed(&first, presented, account_id) {
+            return Ok(Some(outcome));
+        }
+        // Expired (or the caller's own copy was rejected): refresh once,
+        // under Claude Code's refresh lock, so no Claude Code process spends
+        // the same token meanwhile. A Claude Code that was refreshing when
+        // the lock was asked for has published its rotation by the time it
+        // is granted; the re-read below adopts it.
+        let lock_files = files.clone();
+        let lock =
+            off_thread(move || crate::credentials::ClaudeCodeRefreshLock::acquire(&lock_files))
+                .await
+                .ok()
+                .flatten();
+        let Some(_lock) = lock else {
+            return Err(Error::RefreshRefused(
+                "Claude Code is refreshing this login (its refresh lock is held); \
+                 refresh was not attempted"
+                    .into(),
+            ));
+        };
+        let mut healed = false;
+        loop {
+            let current = reconcile(path, files, account_id).await?;
+            if let Some(outcome) = borrowed(&current, presented, account_id) {
+                return Ok(Some(outcome));
+            }
+            let spend = match current {
+                LinkReconcile::NotLinked => return Ok(None),
+                LinkReconcile::Native { tokens, .. } | LinkReconcile::Store { tokens, .. } => {
+                    tokens
+                }
+            };
+            match self
+                .claim_and_refresh(path, account_id, &spend, options)
+                .await
+            {
+                Ok(outcome) => return Ok(Some(outcome)),
+                Err(error)
+                    if !healed
+                        && matches!(classify_refresh_failure(&error), RefreshFailure::Revoked) =>
+                {
+                    // The operator may have logged into Claude Code, which
+                    // revoked the store's login: adopt Claude Code's rather
+                    // than declare the account dead.
+                    healed = true;
+                    match reconcile(path, files, account_id).await? {
+                        LinkReconcile::Native { adopted: true, .. } => continue,
+                        _ => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+/// [`crate::credentials::reconcile_claude_code_link`] off the async worker;
+/// an unreadable store refuses (nothing is spent).
+async fn reconcile(
+    path: &Path,
+    files: &ClaudeCodeFiles,
+    account_id: &str,
+) -> Result<LinkReconcile> {
+    let (path, files, account_id) = (path.to_path_buf(), files.clone(), account_id.to_owned());
+    off_thread(move || crate::credentials::reconcile_claude_code_link(&path, &files, &account_id))
+        .await
+        .map_err(|e| Error::RefreshRefused(format!("claude code link worker failed: {e}")))?
+        .map_err(|error| Error::RefreshRefused(format!("shared store unreadable: {error}")))
+}
+
+/// The linked login's session when it can be handed out without a spend:
+/// live (outside the refresh leeway) and not the copy the caller already
+/// holds (a caller re-presenting its own live token wants a new one).
+fn borrowed(
+    reconciled: &LinkReconcile,
+    presented: &OAuthTokens,
+    account_id: &str,
+) -> Option<SharedRefreshOutcome> {
+    let (tokens, source, native_publish) = match reconciled {
+        LinkReconcile::NotLinked => return None,
+        LinkReconcile::Native { tokens, .. } => (tokens, RefreshSource::ClaudeCode, None),
+        LinkReconcile::Store { tokens, publish } => {
+            (tokens, RefreshSource::AdoptedPeer, Some(publish.clone()))
+        }
+    };
+    if tokens.needs_refresh(Utc::now()) || tokens.access == presented.access {
+        return None;
+    }
+    Some(SharedRefreshOutcome {
+        tokens: tokens.clone(),
+        source,
+        account_id: Some(account_id.to_owned()),
+        native_publish,
+    })
+}
+
+/// Run blocking file work off the async worker (inline without a runtime).
+async fn off_thread<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, String> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.spawn_blocking(work).await.map_err(|e| e.to_string()),
+        Err(_) => Ok(work()),
     }
 }
 
@@ -1483,5 +1650,385 @@ mod tests {
         assert!(!DeadRefreshTokens::is_dead(
             "sk-ant-ort01-yyyyyyyyyyyyyyyyyyyyyyy"
         ));
+    }
+
+    /// One login per account (module docs, step 8). Temp dirs, a mock token
+    /// server, OAuth test mode (`cfg(test)`), and an explicit native path:
+    /// the real `~/.claude` is never resolved.
+    mod claude_code_link {
+        use super::*;
+        use crate::credentials::{NATIVE_CONFIG_FILE_NAME, NATIVE_WRITE_LOCK_NAME, NativePublish};
+
+        const ACCOUNT: &str = "acct-cc-link";
+        const ORG: &str = "org-cc-link";
+
+        fn identified(mut tokens: OAuthTokens) -> OAuthTokens {
+            tokens.account = Some(crate::token::TokenAccount {
+                uuid: ACCOUNT.into(),
+                email_address: Some("me@example.com".into()),
+            });
+            tokens.organization = Some(crate::token::TokenOrganization { uuid: ORG.into() });
+            tokens
+        }
+
+        fn pair(tag: &str, expires_at: DateTime<Utc>) -> OAuthTokens {
+            tokens(
+                &format!("sk-ant-ort01-{tag}-aaaaaaaaaaaaaaaaaaaaaa"),
+                &format!("sk-ant-oat01-{tag}-aaaaaaaaaaaaaaaaaaaaaa"),
+                expires_at,
+            )
+        }
+
+        fn private(path: &Path, value: &serde_json::Value) {
+            std::fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+
+        /// Claude Code's two files beside the test store: the credential
+        /// file holding `native`, and `.claude.json` naming `account`/`org`.
+        fn claude_code(
+            path: &Path,
+            native: &OAuthTokens,
+            account: &str,
+            org: &str,
+        ) -> std::path::PathBuf {
+            let dir = path.parent().unwrap();
+            let credentials = dir.join(".credentials.json");
+            write_native(&credentials, native);
+            private(
+                &dir.join(NATIVE_CONFIG_FILE_NAME),
+                &serde_json::json!({
+                    "projects": {},
+                    "oauthAccount": {
+                        "accountUuid": account,
+                        "organizationUuid": org,
+                        "emailAddress": "me@example.com"
+                    }
+                }),
+            );
+            credentials
+        }
+
+        fn write_native(credentials: &Path, native: &OAuthTokens) {
+            private(
+                credentials,
+                &serde_json::json!({
+                    "claudeAiOauth": {
+                        "accessToken": native.access.expose(),
+                        "refreshToken": native.refresh.expose(),
+                        "expiresAt": native.expires_at.timestamp_millis(),
+                        "scopes": ["user:inference", "user:profile"],
+                        "subscriptionType": "max",
+                        "rateLimitTier": "default_claude_max_20x"
+                    },
+                    "mcpOAuth": { "keep": true }
+                }),
+            );
+        }
+
+        fn native_doc(credentials: &Path) -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(credentials).unwrap()).unwrap()
+        }
+
+        fn linked_client(url: &str, credentials: &Path) -> OAuthClient {
+            client(url).native_publish(NativePublish::At(credentials.to_path_buf()))
+        }
+
+        fn row(path: &Path) -> crate::account::Account {
+            AccountStore::load(path)
+                .unwrap()
+                .get("shared")
+                .unwrap()
+                .clone()
+        }
+
+        #[tokio::test]
+        async fn a_live_claude_code_token_is_borrowed_and_nothing_is_refreshed() {
+            let (url, hits) = token_server(200, ROTATED_BODY).await;
+            let path = store_path("cc-borrow");
+            // The store's copy expired; Claude Code holds the same login,
+            // live (the operator uses Claude Code right now).
+            let stored = identified(pair("cc-borrow-store", at(-10)));
+            seeded_store(&path, &stored);
+            let native = pair("cc-borrow-native", Utc::now() + Duration::hours(6));
+            let credentials = claude_code(&path, &native, ACCOUNT, ORG);
+            let before = std::fs::read(&credentials).unwrap();
+            let client = linked_client(&url, &credentials);
+
+            let outcome = client
+                .refresh_shared(&path, &stored, &SharedRefreshOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(outcome.source, RefreshSource::ClaudeCode);
+            assert_eq!(outcome.tokens.access, native.access);
+            assert_eq!(outcome.account_id.as_deref(), Some("shared"));
+            assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing is spent");
+            // The store now holds the shared login (synced both ways), and
+            // Claude Code's file is untouched.
+            assert_eq!(row(&path).oauth().unwrap().refresh, native.refresh);
+            assert_eq!(std::fs::read(&credentials).unwrap(), before);
+
+            // The coarse entry point borrows it too.
+            let grant = crate::access::get_access_token(
+                &client,
+                &path,
+                &crate::access::AccessRequest::default(),
+                &SharedRefreshOptions::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(grant.source, crate::access::AccessSource::ClaudeCode);
+            assert_eq!(grant.access_token, native.access.expose());
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+
+        #[tokio::test]
+        async fn a_store_login_revoked_by_a_newer_claude_code_login_is_healed_not_dead() {
+            let (url, hits) = token_server(400, INVALID_GRANT_BODY).await;
+            let path = store_path("cc-heal");
+            // The store row was flagged by an earlier invalid_grant on its
+            // (revoked) token. The operator then logged into Claude Code.
+            let stored = identified(pair("cc-heal-store", at(-10)));
+            seeded_store(&path, &stored);
+            AccountStore::mutate(&path, |store| {
+                Ok(store.mark_refresh_token_dead("shared", &stored.refresh))
+            })
+            .unwrap();
+            assert!(row(&path).refresh_token_is_dead());
+            let native = pair("cc-heal-native", Utc::now() + Duration::hours(8));
+            let credentials = claude_code(&path, &native, ACCOUNT, ORG);
+            let client = linked_client(&url, &credentials);
+
+            let grant = crate::access::get_access_token(
+                &client,
+                &path,
+                &crate::access::AccessRequest::default(),
+                &SharedRefreshOptions::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(grant.source, crate::access::AccessSource::ClaudeCode);
+            assert_eq!(grant.access_token, native.access.expose());
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "the revoked token is never spent"
+            );
+            let healed = row(&path);
+            assert_eq!(healed.oauth().unwrap().refresh, native.refresh);
+            assert!(!healed.refresh_token_is_dead());
+            assert!(healed.dead_refresh_fingerprint.is_none());
+            assert!(healed.last_error.is_none());
+            assert!(healed.enabled);
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+
+        #[tokio::test]
+        async fn an_invalid_grant_while_claude_code_logs_in_adopts_its_login() {
+            // Store and Claude Code share one expired token. While the
+            // store's refresh is in flight the operator logs into Claude
+            // Code (a new login: it revokes the shared one, so the endpoint
+            // answers invalid_grant).
+            let path = store_path("cc-race-login");
+            let shared = identified(pair("cc-race-shared", at(-10)));
+            seeded_store(&path, &shared);
+            let credentials = claude_code(&path, &shared, ACCOUNT, ORG);
+            let fresh = pair("cc-race-fresh", Utc::now() + Duration::hours(8));
+            let hook: Arc<dyn Fn() + Send + Sync> = {
+                let (credentials, fresh) = (credentials.clone(), fresh.clone());
+                Arc::new(move || write_native(&credentials, &fresh))
+            };
+            let (url, seen) = recording_server(
+                400,
+                INVALID_GRANT_BODY,
+                std::time::Duration::ZERO,
+                Some(hook),
+            )
+            .await;
+            let outcome = linked_client(&url, &credentials)
+                .refresh_shared(&path, &shared, &SharedRefreshOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(outcome.source, RefreshSource::ClaudeCode);
+            assert_eq!(outcome.tokens.access, fresh.access);
+            assert_eq!(seen.lock().unwrap().len(), 1, "one spend, then adopt");
+            let healed = row(&path);
+            assert_eq!(healed.oauth().unwrap().refresh, fresh.refresh);
+            assert!(!healed.refresh_token_is_dead(), "not marked dead");
+            assert!(healed.current_error().is_none());
+            assert!(!path.parent().unwrap().join(".oauth_refresh.lock").exists());
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+
+        #[tokio::test]
+        async fn an_expired_login_is_refreshed_once_and_published_to_claude_code() {
+            let (url, seen) =
+                recording_server(200, ROTATED_BODY, std::time::Duration::ZERO, None).await;
+            let path = store_path("cc-expired");
+            // The store holds the newer copy (it rotated last); Claude Code
+            // holds an older, different token of the same account. Both
+            // access tokens have expired.
+            let stored = identified(pair("cc-expired-store", at(-10)));
+            seeded_store(&path, &stored);
+            let older = pair("cc-expired-native", at(-3_600));
+            let credentials = claude_code(&path, &older, ACCOUNT, ORG);
+            let outcome = linked_client(&url, &credentials)
+                .refresh_shared(&path, &stored, &SharedRefreshOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(outcome.source, RefreshSource::Refreshed);
+            assert_eq!(outcome.native_publish, Some(NativePublishOutcome::Written));
+            assert_eq!(
+                *seen.lock().unwrap(),
+                vec![stored.refresh.expose().to_owned()],
+                "exactly one spend, of the store's token"
+            );
+            let doc = native_doc(&credentials);
+            assert_eq!(doc["claudeAiOauth"]["refreshToken"], NEW_REFRESH);
+            assert_eq!(doc["claudeAiOauth"]["accessToken"], NEW_ACCESS);
+            assert_eq!(doc["claudeAiOauth"]["subscriptionType"], "max");
+            assert_eq!(doc["mcpOAuth"]["keep"], true);
+            assert_eq!(row(&path).oauth().unwrap().refresh.expose(), NEW_REFRESH);
+            // Claude Code's refresh lock was taken and released.
+            let dir = path.parent().unwrap();
+            assert!(!dir.join(".oauth_refresh.lock").exists());
+            assert!(!dir.join(NATIVE_WRITE_LOCK_NAME).exists());
+
+            // Same token on both sides, expired: one spend, published.
+            let path = store_path("cc-expired-same");
+            let shared = identified(pair("cc-expired-same", at(-10)));
+            seeded_store(&path, &shared);
+            let credentials = claude_code(&path, &shared, ACCOUNT, ORG);
+            let (url, seen) =
+                recording_server(200, ROTATED_BODY, std::time::Duration::ZERO, None).await;
+            let outcome = linked_client(&url, &credentials)
+                .refresh_shared(&path, &shared, &SharedRefreshOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(outcome.source, RefreshSource::Refreshed);
+            assert_eq!(outcome.native_publish, Some(NativePublishOutcome::Written));
+            assert_eq!(seen.lock().unwrap().len(), 1);
+            assert_eq!(
+                native_doc(&credentials)["claudeAiOauth"]["refreshToken"],
+                NEW_REFRESH
+            );
+            std::fs::remove_dir_all(dir).ok();
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+
+        #[tokio::test]
+        async fn claude_code_on_another_account_is_never_touched() {
+            let (url, hits) = token_server(200, ROTATED_BODY).await;
+            let path = store_path("cc-other");
+            let stored = identified(pair("cc-other-store", at(-10)));
+            seeded_store(&path, &stored);
+            // Claude Code is logged into someone else, with a live token.
+            let theirs = pair("cc-other-native", Utc::now() + Duration::hours(6));
+            let credentials = claude_code(&path, &theirs, "acct-someone-else", ORG);
+            let before = std::fs::read(&credentials).unwrap();
+            let client = linked_client(&url, &credentials);
+            let outcome = client
+                .refresh_shared(&path, &stored, &SharedRefreshOptions::default())
+                .await
+                .unwrap();
+            assert_eq!(outcome.source, RefreshSource::Refreshed, "not borrowed");
+            assert_eq!(
+                outcome.native_publish,
+                Some(NativePublishOutcome::OtherAccount)
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            assert_eq!(std::fs::read(&credentials).unwrap(), before);
+            let grant = crate::access::get_access_token(
+                &client,
+                &path,
+                &crate::access::AccessRequest::default(),
+                &SharedRefreshOptions::default(),
+            )
+            .await
+            .unwrap();
+            assert_ne!(grant.access_token, theirs.access.expose());
+            assert_eq!(std::fs::read(&credentials).unwrap(), before);
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_adopt_waits_for_claude_codes_write_in_flight() {
+            let (url, hits) = token_server(200, ROTATED_BODY).await;
+            let path = store_path("cc-concurrent");
+            let stored = identified(pair("cc-concurrent-store", at(-10)));
+            seeded_store(&path, &stored);
+            // Claude Code's file still says the old login; Claude Code is
+            // mid-write of a new one under its write lock.
+            let old = pair("cc-concurrent-old", at(-7_200));
+            let credentials = claude_code(&path, &old, ACCOUNT, ORG);
+            let lock = path.parent().unwrap().join(NATIVE_WRITE_LOCK_NAME);
+            std::fs::create_dir(&lock).unwrap();
+            let fresh = pair("cc-concurrent-fresh", Utc::now() + Duration::hours(8));
+            let writer = {
+                let (credentials, fresh, lock) = (credentials.clone(), fresh.clone(), lock.clone());
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    write_native(&credentials, &fresh);
+                    std::fs::remove_dir(&lock).unwrap();
+                })
+            };
+            let outcome = linked_client(&url, &credentials)
+                .refresh_shared(&path, &stored, &SharedRefreshOptions::default())
+                .await
+                .unwrap();
+            writer.join().unwrap();
+            // The snapshot was taken after Claude Code's write, never during
+            // it: the new login is adopted and borrowed, nothing spent.
+            assert_eq!(outcome.source, RefreshSource::ClaudeCode);
+            assert_eq!(outcome.tokens.access, fresh.access);
+            assert_eq!(row(&path).oauth().unwrap().refresh, fresh.refresh);
+            assert_eq!(hits.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                native_doc(&credentials)["claudeAiOauth"]["refreshToken"],
+                fresh.refresh.expose()
+            );
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
+
+        #[tokio::test]
+        async fn claude_codes_refresh_in_progress_is_waited_for_and_adopted() {
+            // Claude Code holds its refresh lock and publishes a rotation
+            // before releasing it: the store waits, re-reads, adopts.
+            let (url, hits) = token_server(200, ROTATED_BODY).await;
+            let path = store_path("cc-cc-refreshing");
+            let shared = identified(pair("cc-cc-refreshing", at(-10)));
+            seeded_store(&path, &shared);
+            let credentials = claude_code(&path, &shared, ACCOUNT, ORG);
+            let lock = path.parent().unwrap().join(".oauth_refresh.lock");
+            std::fs::create_dir(&lock).unwrap();
+            let rotated = pair("cc-cc-rotated", Utc::now() + Duration::hours(8));
+            let cc = {
+                let (credentials, rotated, lock) =
+                    (credentials.clone(), rotated.clone(), lock.clone());
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    write_native(&credentials, &rotated);
+                    std::fs::remove_dir(&lock).unwrap();
+                })
+            };
+            let outcome = linked_client(&url, &credentials)
+                .refresh_shared(&path, &shared, &SharedRefreshOptions::default())
+                .await
+                .unwrap();
+            cc.join().unwrap();
+            assert_eq!(outcome.source, RefreshSource::ClaudeCode);
+            assert_eq!(outcome.tokens.access, rotated.access);
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "the shared token is never spent twice"
+            );
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        }
     }
 }

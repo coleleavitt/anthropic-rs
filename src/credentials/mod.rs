@@ -3,6 +3,7 @@
 mod file;
 #[cfg(feature = "secure-store")]
 mod keyring;
+mod link;
 mod publish;
 
 use std::path::{Path, PathBuf};
@@ -11,6 +12,24 @@ use chrono::{TimeZone, Utc};
 pub use file::FileSecretStore;
 #[cfg(feature = "secure-store")]
 pub use keyring::KeyringSecretStore;
+pub use link::{
+    ClaudeCodeFiles,
+    ClaudeCodeIdentity,
+    ClaudeCodeLinkStatus,
+    ClaudeCodeLogin,
+    ClaudeCodeRefreshLock,
+    IdentitySource,
+    LinkReconcile,
+    NATIVE_CONFIG_FILE_NAME,
+    NATIVE_REFRESH_LOCK_NAME,
+    NATIVE_REFRESH_LOCK_STALE,
+    is_linked,
+    link_status,
+    read_claude_code_identity,
+    read_claude_code_login,
+    read_claude_code_login_locked,
+    reconcile_claude_code_link,
+};
 pub use publish::{
     NATIVE_PUBLISH_ENV,
     NATIVE_WRITE_LOCK_NAME,
@@ -19,6 +38,7 @@ pub use publish::{
     NativePublish,
     NativePublishOutcome,
     native_publish_enabled_value,
+    publish_native_login,
     publish_native_rotation,
     read_native_claude_summary,
 };
