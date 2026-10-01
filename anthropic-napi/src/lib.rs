@@ -633,6 +633,9 @@ pub struct AnthropicAuth {
     legacy: Vec<PathBuf>,
     native_publish: NativePublish,
     native_path: Option<PathBuf>,
+    /// `nativePublish: 'off'` or `ANTHROPIC_NATIVE_PUBLISH=0`: the link with
+    /// Claude Code is off too (an explicit import is the one-time copy).
+    publish_disabled: bool,
     logins: Arc<Mutex<HashMap<String, PendingLogin>>>,
 }
 
@@ -849,6 +852,7 @@ impl AnthropicAuth {
             legacy,
             native_publish,
             native_path,
+            publish_disabled: !publish_on,
             logins: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -1550,6 +1554,7 @@ impl AnthropicAuth {
             .or_else(|| Some("Claude Code".to_owned()));
         let path = self.path.clone();
         let link_label = label.clone();
+        let link = !self.publish_disabled;
         let linked = blocking(move || {
             match std::fs::symlink_metadata(&file) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1562,6 +1567,9 @@ impl AnthropicAuth {
             }
             let imported =
                 anthropic::import_native_claude_file(Some(&file)).map_err(|e| native_error(&e))?;
+            if !link {
+                return Ok((None, imported));
+            }
             link_claude_code(&path, &file, link_label).map(|linked| (linked, imported))
         })
         .await?;

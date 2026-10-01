@@ -263,9 +263,19 @@ export interface ImportResult {
   accountId: string
   /**
    * `added`: new row; `already_present`: the store holds this exact token;
-   * `kept`: the store already holds this login with its own token (the store wins);
-   * `linked` (`importNativeClaudeAccount` when Claude Code's account is known):
-   * the row now shares Claude Code's login, newest copy winning.
+   * `kept`: the store already holds this login with its own token (the store wins).
+   */
+  status: 'added' | 'already_present' | 'kept'
+}
+
+/** Result of `importNativeClaudeAccount`. */
+export interface NativeImportResult {
+  accountId: string
+  /**
+   * `linked`: Claude Code's `.claude.json` names the account, and the row now
+   * shares Claude Code's login (newest copy wins; created when there was no
+   * row of that account). Otherwise the one-time copy: `added`,
+   * `already_present` or `kept` as for `ImportResult`.
    */
   status: 'added' | 'already_present' | 'kept' | 'linked'
 }
@@ -423,7 +433,7 @@ export declare class AnthropicAuth {
   /** Non-secret facts about Claude Code's credential file, or null. */
   readNativeClaudeOAuth(options?: NativeClaudeOptions | null): Promise<NativeClaudeInfo | null>
   /** Import Claude Code's credential into the store (tokens stay in Rust). */
-  importNativeClaudeAccount(options?: NativeClaudeOptions | null): Promise<ImportResult>
+  importNativeClaudeAccount(options?: NativeClaudeOptions | null): Promise<NativeImportResult>
 }
 
 // Convenience functions over a lazily created default `AnthropicAuth()` (the
@@ -449,4 +459,4 @@ export declare function getApiKey(options?: GetApiKeyOptions | null): Promise<Ap
 export declare function revokeAccount(options: RevokeAccountOptions): Promise<RevokeAccountResult>
 export declare function backfillIdentities(): Promise<BackfillEntry[]>
 export declare function readNativeClaudeOAuth(options?: NativeClaudeOptions | null): Promise<NativeClaudeInfo | null>
-export declare function importNativeClaudeAccount(options?: NativeClaudeOptions | null): Promise<ImportResult>
+export declare function importNativeClaudeAccount(options?: NativeClaudeOptions | null): Promise<NativeImportResult>

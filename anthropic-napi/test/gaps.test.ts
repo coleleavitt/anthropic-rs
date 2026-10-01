@@ -408,6 +408,17 @@ describe('one login per account: the store and Claude Code share a linked login'
     expect(await a.importNativeClaudeAccount({ label: 'CC' })).toEqual({ accountId: 'CC', status: 'linked' })
     expect(readStore().accounts.map((r: any) => r.id)).toEqual(['other', 'CC'])
   })
+
+  test("nativePublish 'off' turns the link off: import is the one-time copy", async () => {
+    seed([linkedRow('mine')])
+    const native = claudeCode(CC_ACCOUNT)
+    const a = new AnthropicAuth({ storePath, tokenUrl, nativeCredentialsPath: native, nativePublish: 'off' })
+    // No link: the row of Claude Code's account is left as it was.
+    expect((await a.importNativeClaudeAccount()).status).not.toBe('linked')
+    expect(readStore().accounts[0].credential.refresh).toBe(SHARED_REFRESH)
+    const token = await a.getAccessToken()
+    expect(token.source).not.toBe('claude_code')
+  })
 })
 
 // ---- revoke ----------------------------------------------------------------
