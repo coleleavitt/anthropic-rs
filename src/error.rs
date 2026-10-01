@@ -64,6 +64,21 @@ pub enum Error {
     #[error("oauth refresh refused (fail-closed): {0}")]
     RefreshRefused(String),
 
+    /// Claude Code's credentials could not be read right now (its
+    /// `.storage-write.lock` stayed held, the Keychain was locked or
+    /// `security` failed or timed out, or an I/O error), for a store row
+    /// that is linked to Claude Code's account. Without that read the row
+    /// cannot be judged: a newer Claude Code login may have revoked the
+    /// row's token, so the row is neither refreshed nor marked dead.
+    /// Transient: retry after `retry_after_ms`.
+    #[error("claude code's credentials are busy ({reason}); retry in {retry_after_ms} ms")]
+    LinkBusy {
+        /// Why the read failed (secret-free).
+        reason: String,
+        /// Suggested wait before retrying, in milliseconds.
+        retry_after_ms: u64,
+    },
+
     /// A network call did not finish inside its deadline. For a refresh this
     /// is deliberately shorter than the refresh claim, so the claim never
     /// lapses while the token is in flight. Transient; the token may or may
@@ -265,6 +280,7 @@ impl Error {
             | Error::CustodyTombstone { .. } => true,
             Error::NoUsableAccount(_)
             | Error::RefreshRefused(_)
+            | Error::LinkBusy { .. }
             | Error::Io(_)
             | Error::Random(_)
             | Error::Federation(_)
@@ -282,6 +298,7 @@ impl Error {
     pub fn retry_after_ms(&self) -> Option<i64> {
         match self {
             Error::Endpoint { retry_after_ms, .. } => *retry_after_ms,
+            Error::LinkBusy { retry_after_ms, .. } => i64::try_from(*retry_after_ms).ok(),
             _ => None,
         }
     }

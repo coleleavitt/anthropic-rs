@@ -5,6 +5,7 @@ mod file;
 mod keyring;
 mod link;
 mod publish;
+pub(crate) mod source;
 
 use std::path::{Path, PathBuf};
 
@@ -19,6 +20,7 @@ pub use link::{
     ClaudeCodeLogin,
     ClaudeCodeRefreshLock,
     IdentitySource,
+    LINK_BUSY_RETRY_AFTER_MS,
     LinkReconcile,
     NATIVE_CONFIG_FILE_NAME,
     NATIVE_REFRESH_LOCK_NAME,
@@ -29,7 +31,10 @@ pub use link::{
     read_claude_code_login,
     read_claude_code_login_locked,
     reconcile_claude_code_link,
+    try_read_claude_code_login,
+    try_read_claude_code_login_locked,
 };
+pub(crate) use link::{Reconciled, link_busy, reconcile_link};
 pub use publish::{
     NATIVE_PUBLISH_ENV,
     NATIVE_WRITE_LOCK_NAME,
@@ -39,12 +44,23 @@ pub use publish::{
     NativePublishOutcome,
     native_publish_enabled_value,
     publish_native_login,
+    publish_native_login_guarded,
     publish_native_rotation,
+    read_claude_code_summary,
     read_native_claude_summary,
 };
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use unicode_normalization::UnicodeNormalization;
+pub use source::{
+    CREDENTIALS_BACKEND_ENV,
+    CredentialBackend,
+    DEFAULT_SECURITY_BIN,
+    KeychainItem,
+    NATIVE_CLAUDE_CREDENTIALS_KEYCHAIN_SERVICE,
+    SECURITY_BIN_ENV,
+    keychain_is_locked,
+    native_claude_credentials_keychain_service,
+    native_claude_credentials_keychain_service_from_lookup,
+};
 
 use crate::error::{Error, Result};
 use crate::token::{
@@ -59,30 +75,20 @@ use crate::token::{
 const MAX_NATIVE_DOCUMENT_BYTES: u64 = 64 * 1024;
 const MAX_TRUSTED_DEVICE_TOKEN_BYTES: usize = 16 * 1024;
 
-/// Production secure-storage service name used by native Claude Code.
+/// Production secure-storage service base name used by native Claude Code
+/// (its `/login`-managed API key lives under exactly this name; its OAuth
+/// credentials under [`NATIVE_CLAUDE_CREDENTIALS_KEYCHAIN_SERVICE`]).
 pub const NATIVE_CLAUDE_KEYRING_SERVICE: &str = "Claude Code";
 
-/// Derive native Claude's production secure-storage service name. A custom
-/// config directory adds the same first-eight-hex SHA-256 suffix as Claude Code;
-/// the default `~/.claude` directory uses the unsuffixed service.
+/// Native Claude's secure-storage service for its **OAuth credentials**:
+/// `Claude Code-credentials`, plus the first-eight-hex SHA-256 suffix of a
+/// custom config directory (the default `~/.claude` is unsuffixed). Before
+/// this named the unsuffixed `Claude Code` item, which is Claude Code's
+/// `/login`-managed API key, not its OAuth document (EVIDENCED in the
+/// Claude Code 2.1.286 darwin bundle: `QN("-credentials")`; see
+/// [`native_claude_credentials_keychain_service`]).
 pub fn native_claude_keyring_service() -> String {
-    let custom_directory = match std::env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR") {
-        Some(value) if value.is_empty() => None,
-        Some(value) => Some(PathBuf::from(value)),
-        None => std::env::var_os("CLAUDE_CONFIG_DIR")
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from),
-    };
-    let Some(directory) = custom_directory else {
-        return NATIVE_CLAUDE_KEYRING_SERVICE.into();
-    };
-    let normalized = directory.to_string_lossy().nfc().collect::<String>();
-    let digest = Sha256::digest(normalized.as_bytes());
-    let suffix = digest[..4]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("{NATIVE_CLAUDE_KEYRING_SERVICE}-{suffix}")
+    native_claude_credentials_keychain_service()
 }
 
 /// Minimal interface used for OAuth, API-key, trusted-device-token, and private-key secrets.

@@ -96,6 +96,41 @@ Store safety properties, each covered by a test:
   linked row re-reads Claude Code first and heals by adopting its newer login
   instead of marking the account dead. The keep-alive skips linked rows while
   Claude Code's token is live.
+- **Link edge cases** — (1) *busy never means dead*: for a row of Claude
+  Code's account, every path that could mark it dead first reads Claude
+  Code's credentials under its `.storage-write.lock`; when that lock stays
+  held past the bounded wait (~7 s), the Keychain is locked, or the read
+  fails, the call returns `Error::LinkBusy { reason, retry_after_ms }`
+  (`AccessErrorKind::Transient`, `AccessError::retry_after_ms`): nothing is
+  spent, nothing is marked dead, and the next call adopts. (2) *`/login`
+  during a refresh*: after a linked row's refresh is committed, Claude Code's
+  credentials are re-read under its lock; a login the store never wrote (a
+  `claude /login` while the token was in flight, which revoked the rotation)
+  is adopted and its access token returned, and the publish replaces only
+  the copy judged before the spend (`publish_native_login_guarded`), so that
+  login is never overwritten, whatever its expiry. (3) *macOS Keychain*: see
+  below.
+- **Claude Code's credential backend** (`credentials::CredentialBackend`) —
+  `File` (`.credentials.json`) or `Keychain`: on macOS Claude Code keeps its
+  OAuth document in the login Keychain, generic password service
+  `Claude Code-credentials` (plus `-<first 8 hex of sha256(dir)>` for a custom
+  `CLAUDE_CONFIG_DIR` / `CLAUDE_SECURESTORAGE_CONFIG_DIR`), account `$USER`
+  (else `claude-code-user`); EVIDENCED in the Claude Code 2.1.286
+  darwin-arm64 bundle (`QN("-credentials")`, `ok()`, `security
+  find-generic-password -a <acct> -w -s <svc>`, `security -i` +
+  `add-generic-password -U -a .. -s .. -X <hex>`). The crate reaches it through
+  `/usr/bin/security` the same way: reads with `find-generic-password -w`
+  (2 s timeout; exit 44 = no item, 36 = locked), writes the hex document on
+  `security -i` **stdin**, never argv (argv `-X <hex>` only above Claude
+  Code's 4032-byte stdin line limit, as Claude Code does; a credential
+  document is ~600 bytes). Selection: `ANTHROPIC_CLAUDE_CREDENTIALS_BACKEND=file|keychain`,
+  else the Keychain on macOS when there is no `.credentials.json`, else the
+  file; `ANTHROPIC_SECURITY_BIN` names the `security` binary (tests use a
+  fake), and `OAuthClient::claude_code_backend` overrides per client. Link,
+  borrow, adopt, publish and the busy rule work over either backend with the
+  same rules (never create an item, keep unknown keys, never another
+  account) and the same `.storage-write.lock`. `keychain_is_locked` probes
+  with `security show-keychain-info` (no UI) for read-only callers.
 - **Publish by account** — after a rotation (or a new login) the new pair is
   written to Claude Code's `.credentials.json` when it holds the spent token,
   or when Claude Code is logged into the same account with an older copy
@@ -190,7 +225,7 @@ a fixture refresh token to production.
 ## Federation, native storage, and devices
 
 - `FederationEnvironment` implements Anthropic WIF precedence, projected assertion rereads, 16 KiB bounds, and a single-flight 120s/30s cache.
-- Native Claude import derives the `Claude Code[-<config hash>]` vault service and username account, then falls back read-only to `~/.claude/.credentials.json`. Explicit import is separate from discovery.
+- Native Claude import derives the `Claude Code-credentials[-<config hash>]` vault service (the OAuth item; the unsuffixed `Claude Code` item is Claude Code's `/login`-managed API key) and username account, then falls back read-only to `~/.claude/.credentials.json`. Explicit import is separate from discovery.
 - `DeviceIdentityStore` persists one 32-byte global ID in `device.json`; trusted-device tokens and Cowork PKCS#8 keys use `SecretStore`, never account JSON.
 - Remote Control attestation normalizes every native status and fails malformed enforced policy closed. Cowork uses P-256 SPKI registration and exact P1363 create-session binding.
 - `sign_request_body` implements the independently verified 2.1.233 CCH seed `0x4d659218e32a3268` with the 2.1.172+ global model/max-token preimage transform, including nested fields.

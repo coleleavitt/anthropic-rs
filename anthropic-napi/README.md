@@ -95,6 +95,19 @@ and the two share one login, kept in step both ways (newest copy wins):
 - `keepAliveOnce` skips linked rows while Claude Code's token is live
   (`claude_code_live`).
 
+Edge cases: when Claude Code's credentials cannot be read for a linked row
+(its `.storage-write.lock` stays held past ~7 s, the macOS Keychain is
+locked, `security` fails), `getAccessToken` fails with code `transient` and a
+`retry in N ms` hint, and the row is neither refreshed nor marked dead; the
+next call adopts. A `claude /login` that lands while the store's refresh is in
+flight is adopted right after the commit (its token is returned, never the
+revoked rotation), and Claude Code's new login is never overwritten. On macOS
+Claude Code keeps its credentials in the login Keychain (service
+`Claude Code-credentials`, account `$USER`); the crate reaches it through
+`/usr/bin/security` (`ANTHROPIC_CLAUDE_CREDENTIALS_BACKEND=file|keychain`
+overrides the choice, `ANTHROPIC_SECURITY_BIN` names the binary) with the same
+rules. The binding API is unchanged.
+
 Every write to Claude Code's file keeps the old safety: never created, never
 through a symlink, never over a file it cannot parse, every other field kept,
 0600 through a temp file and rename, under Claude Code's credential-write lock

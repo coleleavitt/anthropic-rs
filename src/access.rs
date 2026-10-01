@@ -158,6 +158,10 @@ pub struct AccessError {
     pub kind: AccessErrorKind,
     /// Human-readable, secret-free detail.
     pub message: String,
+    /// Suggested wait before retrying, in milliseconds, when the failure
+    /// carries one (e.g. Claude Code's credentials were busy:
+    /// [`Error::LinkBusy`]).
+    pub retry_after_ms: Option<u64>,
 }
 
 impl AccessError {
@@ -166,6 +170,7 @@ impl AccessError {
         Self {
             kind,
             message: crate::token::redact_secrets(&message.into()),
+            retry_after_ms: None,
         }
     }
 
@@ -183,10 +188,17 @@ impl AccessError {
             | Error::CustodyTombstone { .. }
             | Error::Config(_)
             | Error::Url(_) => AccessErrorKind::Config,
+            // Claude Code's credentials could not be read: never a dead
+            // verdict, retry shortly.
+            Error::LinkBusy { .. } => AccessErrorKind::Transient,
             other if other.is_invalid_grant() => AccessErrorKind::InvalidGrant,
             _ => AccessErrorKind::Transient,
         };
-        Self::new(kind, error.to_string())
+        let mut classified = Self::new(kind, error.to_string());
+        if let Error::LinkBusy { retry_after_ms, .. } = error {
+            classified.retry_after_ms = Some(*retry_after_ms);
+        }
+        classified
     }
 }
 
@@ -368,6 +380,9 @@ pub async fn get_access_token(
     let login = files
         .as_ref()
         .and_then(|files| crate::credentials::read_claude_code_login(files, Some(&store)));
+    // Rows whose Claude Code link could not be read right now: never
+    // refreshed or served from their own (possibly revoked) copy this call.
+    let mut busy: Vec<(String, Error)> = Vec::new();
     for account in &candidates {
         if let (Some(files), Some(login)) = (&files, &login)
             && crate::credentials::is_linked(account, &login.identity)
@@ -381,8 +396,15 @@ pub async fn get_access_token(
                 crate::credentials::reconcile_claude_code_link(&path, &files, &id)
             })
             .await
-            .map_err(|e| AccessError::new(AccessErrorKind::Transient, e.to_string()))?
-            .map_err(|e| AccessError::from_error(&e))?;
+            .map_err(|e| AccessError::new(AccessErrorKind::Transient, e.to_string()))?;
+            let reconciled = match reconciled {
+                Ok(reconciled) => reconciled,
+                Err(error @ Error::LinkBusy { .. }) => {
+                    busy.push((account.id.clone(), error));
+                    continue;
+                }
+                Err(error) => return Err(AccessError::from_error(&error)),
+            };
             match reconciled {
                 crate::credentials::LinkReconcile::Native { tokens, .. }
                     if !tokens.needs_refresh(now) =>
@@ -406,12 +428,16 @@ pub async fn get_access_token(
         }
     }
 
+    let is_busy = |account: &Account| busy.iter().any(|(id, _)| *id == account.id);
     let mut errors: Vec<Error> = Vec::new();
     let mut refreshable = 0usize;
     for account in &candidates {
         let Some(tokens) = account.oauth() else {
             continue;
         };
+        if is_busy(account) {
+            continue;
+        }
         if refresh_exclusion(account, now).is_some() {
             continue;
         }
@@ -442,6 +468,9 @@ pub async fn get_access_token(
 
     // Every refresh failed; a token merely inside the leeway still works.
     for account in &candidates {
+        if is_busy(account) {
+            continue;
+        }
         if let Some(tokens) = account.oauth()
             && !tokens.access.expose().is_empty()
             && !tokens.is_expired(now)
@@ -450,6 +479,14 @@ pub async fn get_access_token(
         }
     }
 
+    // A busy link is retried, never reported as a dead login.
+    if let Some(busy) = errors
+        .iter()
+        .find(|e| matches!(e, Error::LinkBusy { .. }))
+        .or_else(|| busy.first().map(|(_, e)| e))
+    {
+        return Err(AccessError::from_error(busy));
+    }
     if refreshable == 0 {
         return Err(AccessError::new(
             AccessErrorKind::InvalidGrant,

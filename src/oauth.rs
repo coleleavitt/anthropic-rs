@@ -345,6 +345,8 @@ pub struct OAuthClient {
     require_loopback: bool,
     #[cfg(feature = "store")]
     native_publish: crate::credentials::NativePublish,
+    #[cfg(feature = "store")]
+    claude_code_backend: Option<crate::credentials::CredentialBackend>,
 }
 
 #[cfg(feature = "client")]
@@ -358,6 +360,8 @@ impl OAuthClient {
             require_loopback: false,
             #[cfg(feature = "store")]
             native_publish: crate::credentials::NativePublish::from_env(),
+            #[cfg(feature = "store")]
+            claude_code_backend: None,
         }
     }
 
@@ -373,6 +377,8 @@ impl OAuthClient {
             require_loopback: false,
             #[cfg(feature = "store")]
             native_publish: crate::credentials::NativePublish::from_env(),
+            #[cfg(feature = "store")]
+            claude_code_backend: None,
         }
     }
 
@@ -403,6 +409,23 @@ impl OAuthClient {
     #[cfg(feature = "store")]
     pub fn native_publish_policy(&self) -> &crate::credentials::NativePublish {
         &self.native_publish
+    }
+
+    /// Reach Claude Code's credentials through `backend` instead of the one
+    /// the policy resolves (the file, or the Keychain on macOS when there is
+    /// no `.credentials.json`; [`crate::credentials::CredentialBackend::from_lookup`]).
+    /// For hosts that know better, and for tests of the Keychain backend
+    /// against a fake `security`.
+    #[cfg(feature = "store")]
+    pub fn claude_code_backend(mut self, backend: crate::credentials::CredentialBackend) -> Self {
+        self.claude_code_backend = Some(backend);
+        self
+    }
+
+    /// The backend override (see [`OAuthClient::claude_code_backend`]).
+    #[cfg(feature = "store")]
+    pub fn claude_code_backend_override(&self) -> Option<&crate::credentials::CredentialBackend> {
+        self.claude_code_backend.as_ref()
     }
 
     /// Whether this client is in OAuth test mode (forced, or from the

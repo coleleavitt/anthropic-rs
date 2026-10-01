@@ -61,7 +61,6 @@ pub const NATIVE_WRITE_LOCK_STALE: Duration = Duration::from_secs(15);
 const LOCK_RETRIES: u32 = 10;
 const LOCK_MIN_WAIT: Duration = Duration::from_millis(100);
 const LOCK_MAX_WAIT: Duration = Duration::from_millis(1_000);
-const MAX_NATIVE_DOCUMENT_BYTES: u64 = 64 * 1024;
 
 /// Whether (and where) a rotation is published to Claude Code's file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,8 +135,8 @@ pub enum NativePublishOutcome {
     /// `oauthAccount` names another account or organization); never
     /// written.
     OtherAccount,
-    /// There is no file (no Claude Code install, or a keychain-backed one);
-    /// it is never created.
+    /// There is no credential to replace (no file, or, for the Keychain
+    /// backend, no item); it is never created.
     Absent,
     /// The file is not JSON (possibly mid-write); refused rather than
     /// clobbered.
@@ -178,7 +177,8 @@ pub fn publish_native_rotation(
     spent: &RefreshToken,
     rotated: &OAuthTokens,
 ) -> NativePublishOutcome {
-    publish_with(path, rotated, &|held, _| {
+    let files = super::link::ClaudeCodeFiles::for_credentials(path);
+    publish_with(&files, rotated, &|held, _| {
         if held == Some(spent.expose()) {
             Verdict::Write
         } else {
@@ -207,8 +207,24 @@ pub fn publish_native_login(
     spent: Option<&RefreshToken>,
     rotated: &OAuthTokens,
 ) -> NativePublishOutcome {
+    publish_native_login_guarded(files, spent, None, rotated)
+}
+
+/// [`publish_native_login`] for a caller that judged Claude Code's copy
+/// older moments ago: with `native_before` (the refresh token Claude Code
+/// held then), a copy of the same account is replaced only when it is still
+/// exactly that token (or `spent`). Anything else was written since, by a
+/// Claude Code `/login` or refresh, and is a newer login that this must
+/// never overwrite ([`NativePublishOutcome::NotHeld`]), whatever its expiry.
+/// Without `native_before` it is [`publish_native_login`].
+pub fn publish_native_login_guarded(
+    files: &super::link::ClaudeCodeFiles,
+    spent: Option<&RefreshToken>,
+    native_before: Option<&RefreshToken>,
+    rotated: &OAuthTokens,
+) -> NativePublishOutcome {
     let target = super::link::ClaudeCodeIdentity::of_tokens(rotated);
-    publish_with(&files.credentials, rotated, &|held, held_expires_at| {
+    publish_with(files, rotated, &|held, held_expires_at| {
         if held.is_some() && spent.is_some_and(|spent| held == Some(spent.expose())) {
             return Verdict::Write;
         }
@@ -216,13 +232,16 @@ pub fn publish_native_login(
             return Verdict::Skip(NativePublishOutcome::NotHeld);
         };
         match super::link::read_claude_code_identity(&files.config) {
-            Some(native) if native.same_account(target) => {
-                if held_expires_at.is_some_and(|at| at >= rotated.expires_at.timestamp_millis()) {
+            Some(native) if native.same_account(target) => match native_before {
+                Some(before) if held == Some(before.expose()) => Verdict::Write,
+                Some(_) => Verdict::Skip(NativePublishOutcome::NotHeld),
+                None if held_expires_at
+                    .is_some_and(|at| at >= rotated.expires_at.timestamp_millis()) =>
+                {
                     Verdict::Skip(NativePublishOutcome::NotHeld)
-                } else {
-                    Verdict::Write
                 }
-            }
+                None => Verdict::Write,
+            },
             Some(_) => Verdict::Skip(NativePublishOutcome::OtherAccount),
             None => Verdict::Skip(NativePublishOutcome::NotHeld),
         }
@@ -235,40 +254,24 @@ enum Verdict {
 }
 
 fn publish_with(
-    path: &Path,
+    files: &super::link::ClaudeCodeFiles,
     rotated: &OAuthTokens,
     decide: &dyn Fn(Option<&str>, Option<i64>) -> Verdict,
 ) -> NativePublishOutcome {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return NativePublishOutcome::Absent;
-        }
-        Err(error) => return NativePublishOutcome::Failed(io_message(&error)),
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return NativePublishOutcome::Refused("the native credential file is a symlink");
-        }
-        Ok(meta) if !meta.is_file() => {
-            return NativePublishOutcome::Refused(
-                "the native credential file is not a regular file",
-            );
-        }
-        Ok(_) => {}
-    }
-    // Decide without the lock first: a file that is not to be written (the
-    // common case) is never locked, only read.
-    match prepare(path, rotated, decide) {
+    // Decide without the lock first: a credential that is not to be written
+    // (the common case) is never locked, only read.
+    match prepare(files, rotated, decide) {
         Prepared::Write(_) => {}
         Prepared::Done(outcome) => return outcome,
     }
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    let Some(_lock) = NativeWriteLock::acquire(directory) else {
+    let Ok(_lock) = NativeWriteLock::try_acquire(files.config_directory()) else {
         return NativePublishOutcome::LockBusy;
     };
     // Re-read under Claude Code's write lock: it may have written meanwhile.
-    match prepare(path, rotated, decide) {
-        Prepared::Write(bytes) => match write_replace_private(path, &bytes) {
+    match prepare(files, rotated, decide) {
+        Prepared::Write(bytes) => match super::source::write_raw(files, &bytes) {
             Ok(()) => NativePublishOutcome::Written,
-            Err(error) => NativePublishOutcome::Failed(io_message(&error)),
+            Err(message) => NativePublishOutcome::Failed(message),
         },
         Prepared::Done(outcome) => outcome,
     }
@@ -282,34 +285,21 @@ enum Prepared {
 }
 
 fn prepare(
-    path: &Path,
+    files: &super::link::ClaudeCodeFiles,
     rotated: &OAuthTokens,
     decide: &dyn Fn(Option<&str>, Option<i64>) -> Verdict,
 ) -> Prepared {
     use Prepared::Done;
-    let raw = match crate::file_security::read_bounded_regular(
-        path,
-        MAX_NATIVE_DOCUMENT_BYTES,
-        false,
-        "native credential file",
-    ) {
-        Ok(raw) => raw,
-        Err(crate::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Done(NativePublishOutcome::Absent);
-        }
-        Err(crate::Error::StoreIsSymlink) => {
-            return Done(NativePublishOutcome::Refused(
-                "the native credential file is a symlink",
-            ));
-        }
-        Err(crate::Error::Protocol(_)) => {
-            return Done(NativePublishOutcome::Refused(
-                "the native credential file is not a regular file or exceeds 64 KiB",
-            ));
-        }
-        Err(error) => {
+
+    use super::source::NativeRaw;
+    let raw = match super::source::read_raw(files, false) {
+        NativeRaw::Present(raw) => raw,
+        // Never created: no file, or no Keychain item.
+        NativeRaw::Absent => return Done(NativePublishOutcome::Absent),
+        NativeRaw::Refused(why) => return Done(NativePublishOutcome::Refused(why)),
+        NativeRaw::Unavailable(message) => {
             return Done(NativePublishOutcome::Failed(crate::token::redact_secrets(
-                &error.to_string(),
+                &message,
             )));
         }
     };
@@ -363,14 +353,10 @@ fn prepare(
     }
 }
 
-fn io_message(error: &std::io::Error) -> String {
-    crate::token::redact_secrets(&format!("native credential file: {error}"))
-}
-
 /// Replace `path` with `bytes` through a `0600` temp sibling (`fsync`,
 /// symlink re-check, `rename`, directory `fsync`). Unlike the store writer it
 /// never creates or re-permissions the directory: it is Claude Code's.
-fn write_replace_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_replace_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
@@ -412,12 +398,21 @@ fn write_replace_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub(crate) struct NativeWriteLock;
 
 impl NativeWriteLock {
-    pub(crate) fn acquire(config_directory: &Path) -> Option<ProperLock> {
-        ProperLock::acquire(
+    pub(crate) fn try_acquire(config_directory: &Path) -> Result<ProperLock, LockFailure> {
+        ProperLock::try_acquire(
             &config_directory.join(NATIVE_WRITE_LOCK_NAME),
             NATIVE_WRITE_LOCK_STALE,
         )
     }
+}
+
+/// Why a [`ProperLock`] was not taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LockFailure {
+    /// A live holder kept it through every retry.
+    Busy,
+    /// `mkdir` failed for another reason (e.g. `NotFound`: no config dir).
+    Io(std::io::ErrorKind),
 }
 
 /// A `proper-lockfile` lock: a directory created with `mkdir` (atomic),
@@ -430,11 +425,15 @@ pub(crate) struct ProperLock {
 
 impl ProperLock {
     pub(crate) fn acquire(path: &Path, stale: Duration) -> Option<Self> {
+        Self::try_acquire(path, stale).ok()
+    }
+
+    pub(crate) fn try_acquire(path: &Path, stale: Duration) -> Result<Self, LockFailure> {
         let mut wait = LOCK_MIN_WAIT;
         for attempt in 0..=LOCK_RETRIES {
             match std::fs::create_dir(path) {
                 Ok(()) => {
-                    return Some(Self {
+                    return Ok(Self {
                         path: path.to_path_buf(),
                     });
                 }
@@ -446,7 +445,7 @@ impl ProperLock {
                         continue;
                     }
                 }
-                Err(_) => return None,
+                Err(error) => return Err(LockFailure::Io(error.kind())),
             }
             if attempt == LOCK_RETRIES {
                 break;
@@ -454,7 +453,7 @@ impl ProperLock {
             std::thread::sleep(wait);
             wait = (wait * 2).min(LOCK_MAX_WAIT);
         }
-        None
+        Err(LockFailure::Busy)
     }
 }
 
@@ -511,6 +510,47 @@ pub fn read_native_claude_summary(
     let imported = super::import_native_claude_file(Some(&path))?;
     Ok(Some(NativeOAuthSummary {
         path,
+        expires_at: imported.tokens.expires_at.timestamp_millis(),
+        refresh_expires_at: imported
+            .tokens
+            .refresh_expires_at
+            .map(|at| at.timestamp_millis()),
+        scopes: imported.tokens.scopes.clone(),
+        subscription_type: imported.subscription_type.clone(),
+        rate_limit_tier: imported.rate_limit_tier.clone(),
+        refresh_fingerprint: crate::token::token_fingerprint(imported.tokens.refresh.expose()),
+    }))
+}
+
+/// [`read_native_claude_summary`] through the backend of `files`: the
+/// credential file, or Claude Code's Keychain item. `Ok(None)` when there is
+/// none; a Keychain read that cannot be made right now (locked, `security`
+/// failed) is [`crate::Error::LinkBusy`]. For the Keychain, `path` is the
+/// `.credentials.json` path Claude Code would fall back to.
+pub fn read_claude_code_summary(
+    files: &super::link::ClaudeCodeFiles,
+) -> crate::Result<Option<NativeOAuthSummary>> {
+    let super::source::CredentialBackend::Keychain(item) = &files.backend else {
+        return read_native_claude_summary(Some(&files.credentials));
+    };
+    let raw = match super::source::read_raw(files, true) {
+        super::source::NativeRaw::Present(raw) => raw,
+        super::source::NativeRaw::Absent | super::source::NativeRaw::Refused(_) => {
+            return Ok(None);
+        }
+        super::source::NativeRaw::Unavailable(reason) => {
+            return Err(super::link::link_busy(reason));
+        }
+    };
+    let imported = super::parse_native_document(
+        &raw,
+        super::NativeClaudeCredentialSource::SecureStorage {
+            service: item.service.clone(),
+            account: item.account.clone(),
+        },
+    )?;
+    Ok(Some(NativeOAuthSummary {
+        path: files.credentials.clone(),
         expires_at: imported.tokens.expires_at.timestamp_millis(),
         refresh_expires_at: imported
             .tokens

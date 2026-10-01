@@ -406,7 +406,11 @@ impl crate::oauth::OAuthClient {
                         // path; anything else is noted against this token so
                         // an operator can see why the account was not kept
                         // alive. Bound to the token, it clears on rotation.
-                        if failure != crate::refresh::RefreshFailure::Revoked {
+                        // A busy Claude Code link says nothing about this
+                        // token either: it is retried on the next pass.
+                        if failure != crate::refresh::RefreshFailure::Revoked
+                            && !matches!(error, crate::Error::LinkBusy { .. })
+                        {
                             let _ = AccountStore::mutate(path, |store| {
                                 Ok(store.record_refresh_error(
                                     &current.id,

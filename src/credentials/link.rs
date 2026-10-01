@@ -43,10 +43,16 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-use super::publish::{NativeWriteLock, ProperLock};
-use super::{NativePublish, NativePublishOutcome, import_native_claude_file};
+use super::publish::{LockFailure, NativeWriteLock, ProperLock};
+use super::source::{CredentialBackend, NativeRaw};
+use super::{
+    NativeClaudeCredentialSource,
+    NativeClaudeImport,
+    NativePublish,
+    NativePublishOutcome,
+};
 use crate::account::Account;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::store::AccountStore;
 use crate::token::{OAuthTokens, RefreshToken, TokenAccount, TokenOrganization};
 
@@ -65,20 +71,31 @@ pub const NATIVE_REFRESH_LOCK_STALE: Duration = Duration::from_secs(60);
 /// `oauthAccount` block, and refused above this size.
 const MAX_CONFIG_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Claude Code's two files: the credential file and the global config that
-/// names the logged-in account.
+/// How long a caller should wait after [`Error::LinkBusy`] (Claude Code's
+/// write lock is normally held for milliseconds; a crashed holder goes stale
+/// after 15 s).
+pub const LINK_BUSY_RETRY_AFTER_MS: u64 = 2_000;
+
+/// Claude Code's credential source and the global config that names the
+/// logged-in account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeCodeFiles {
-    /// `.credentials.json` (the tokens).
+    /// `.credentials.json` (the tokens, for [`CredentialBackend::File`]). Its
+    /// directory is Claude Code's config directory, where its locks live,
+    /// for every backend.
     pub credentials: PathBuf,
     /// `.claude.json` (`oauthAccount`: who is logged in).
     pub config: PathBuf,
+    /// Where the tokens are kept: the file above, or the macOS Keychain.
+    pub backend: CredentialBackend,
 }
 
 impl ClaudeCodeFiles {
     /// Claude Code's own files from an environment lookup: the credential
-    /// file as [`super::native_claude_credentials_path_from_lookup`], and
-    /// `$CLAUDE_CONFIG_DIR/.claude.json`, else `$HOME/.claude.json`.
+    /// file as [`super::native_claude_credentials_path_from_lookup`],
+    /// `$CLAUDE_CONFIG_DIR/.claude.json`, else `$HOME/.claude.json`, and the
+    /// backend as [`CredentialBackend::from_lookup`] (the Keychain on macOS
+    /// when there is no `.credentials.json`).
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
         let credentials = super::native_claude_credentials_path_from_lookup(&lookup);
         let config = match lookup("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
@@ -91,9 +108,11 @@ impl ClaudeCodeFiles {
                 PathBuf::from(home).join(NATIVE_CONFIG_FILE_NAME)
             }
         };
+        let backend = CredentialBackend::from_lookup(&lookup, &credentials);
         Self {
             credentials,
             config,
+            backend,
         }
     }
 
@@ -122,7 +141,15 @@ impl ClaudeCodeFiles {
         Self {
             credentials: credentials.to_path_buf(),
             config,
+            backend: CredentialBackend::File,
         }
+    }
+
+    /// The same files with another credential backend.
+    #[must_use]
+    pub fn with_backend(mut self, backend: CredentialBackend) -> Self {
+        self.backend = backend;
+        self
     }
 
     /// Claude Code's config directory (where its locks live).
@@ -135,13 +162,24 @@ impl NativePublish {
     /// Claude Code's files for the link and the by-account publish, or
     /// `None` when the policy is off or (for `Auto`) OAuth test mode
     /// suppresses it. `At(path)` names the credential file; its
-    /// `.claude.json` is found by [`ClaudeCodeFiles::for_credentials`].
+    /// `.claude.json` is found by [`ClaudeCodeFiles::for_credentials`], and
+    /// its backend is the file unless
+    /// [`super::CREDENTIALS_BACKEND_ENV`] explicitly says `keychain` (how
+    /// the Keychain backend is exercised against a fake `security`).
     pub fn files(&self, test_mode: bool) -> Option<ClaudeCodeFiles> {
         match self {
             Self::Off => None,
             Self::Auto if test_mode => None,
             Self::Auto => Some(ClaudeCodeFiles::from_env()),
-            Self::At(path) => Some(ClaudeCodeFiles::for_credentials(path)),
+            Self::At(path) => {
+                let files = ClaudeCodeFiles::for_credentials(path);
+                Some(
+                    match CredentialBackend::explicit_from_lookup(|k| std::env::var(k).ok()) {
+                        Some(backend) => files.with_backend(backend),
+                        None => files,
+                    },
+                )
+            }
         }
     }
 }
@@ -241,32 +279,75 @@ pub struct ClaudeCodeLogin {
     pub identity_source: IdentitySource,
 }
 
+/// The error for a Claude Code credential read that could not be made right
+/// now (secret-free reason).
+pub(crate) fn link_busy(reason: impl Into<String>) -> Error {
+    Error::LinkBusy {
+        reason: crate::token::redact_secrets(&reason.into()),
+        retry_after_ms: LINK_BUSY_RETRY_AFTER_MS,
+    }
+}
+
+/// Claude Code's credential document through its backend: `Ok(None)` when
+/// there is none or it is unusable (absent, a symlink, group/world
+/// readable, malformed: Claude Code treats a corrupt document as no login
+/// too), `Err(reason)` when it could not be read right now.
+fn load_native(files: &ClaudeCodeFiles) -> std::result::Result<Option<NativeClaudeImport>, String> {
+    let raw = match super::source::read_raw(files, true) {
+        NativeRaw::Present(raw) => raw,
+        NativeRaw::Absent | NativeRaw::Refused(_) => return Ok(None),
+        NativeRaw::Unavailable(reason) => return Err(reason),
+    };
+    let source = match &files.backend {
+        CredentialBackend::File => {
+            NativeClaudeCredentialSource::CredentialsFile(files.credentials.clone())
+        }
+        CredentialBackend::Keychain(item) => NativeClaudeCredentialSource::SecureStorage {
+            service: item.service.clone(),
+            account: item.account.clone(),
+        },
+    };
+    Ok(super::parse_native_document(&raw, source).ok())
+}
+
 /// Read Claude Code's login from `files`, or `None` when there is no usable
-/// credential file or no identity. `store` supplies the local fallback
-/// identity (a row holding Claude Code's exact refresh or access token).
-/// Never calls the network and never writes.
+/// credential, no identity, or it cannot be read right now. `store` supplies
+/// the local fallback identity (a row holding Claude Code's exact refresh or
+/// access token). Never calls the network and never writes.
 pub fn read_claude_code_login(
     files: &ClaudeCodeFiles,
     store: Option<&AccountStore>,
 ) -> Option<ClaudeCodeLogin> {
-    if std::fs::symlink_metadata(&files.credentials).is_err() {
-        return None;
-    }
-    let mut tokens = import_native_claude_file(Some(&files.credentials))
-        .ok()?
-        .tokens;
+    try_read_claude_code_login(files, store).ok().flatten()
+}
+
+/// [`read_claude_code_login`] that tells "no login" (`Ok(None)`) from "could
+/// not read it right now" ([`Error::LinkBusy`]: an I/O error, a locked
+/// Keychain, a failed or timed-out `security`).
+pub fn try_read_claude_code_login(
+    files: &ClaudeCodeFiles,
+    store: Option<&AccountStore>,
+) -> Result<Option<ClaudeCodeLogin>> {
+    let mut tokens = match load_native(files) {
+        Ok(Some(import)) => import.tokens,
+        Ok(None) => return Ok(None),
+        Err(reason) => return Err(link_busy(reason)),
+    };
     let (identity, identity_source) = match read_claude_code_identity(&files.config) {
         Some(identity) => (identity, IdentitySource::Config),
         None => {
-            let row = store?.accounts.iter().find(|a| {
-                a.oauth().is_some_and(|t| {
-                    t.refresh == tokens.refresh || t.access.expose() == tokens.access.expose()
-                })
-            })?;
-            (
-                ClaudeCodeIdentity::of_tokens(row.oauth()?)?,
-                IdentitySource::Store,
-            )
+            let found = store.and_then(|store| {
+                let row = store.accounts.iter().find(|a| {
+                    a.oauth().is_some_and(|t| {
+                        t.refresh == tokens.refresh || t.access.expose() == tokens.access.expose()
+                    })
+                })?;
+                ClaudeCodeIdentity::of_tokens(row.oauth()?)
+            });
+            match found {
+                Some(identity) => (identity, IdentitySource::Store),
+                None => return Ok(None),
+            }
         }
     };
     tokens.account = Some(TokenAccount {
@@ -276,11 +357,11 @@ pub fn read_claude_code_login(
     tokens.organization = Some(TokenOrganization {
         uuid: identity.organization_uuid.clone(),
     });
-    Some(ClaudeCodeLogin {
+    Ok(Some(ClaudeCodeLogin {
         tokens,
         identity,
         identity_source,
-    })
+    }))
 }
 
 /// [`read_claude_code_login`] under Claude Code's `.storage-write.lock`, so
@@ -290,11 +371,40 @@ pub fn read_claude_code_login_locked(
     files: &ClaudeCodeFiles,
     store: Option<&AccountStore>,
 ) -> Option<ClaudeCodeLogin> {
-    if std::fs::symlink_metadata(&files.credentials).is_err() {
-        return None;
+    try_read_claude_code_login_locked(files, store)
+        .ok()
+        .flatten()
+}
+
+/// [`read_claude_code_login_locked`] that reports a lock held past its
+/// bounded wait (about 7 s), or a read that failed transiently, as
+/// [`Error::LinkBusy`] instead of "no login". A missing config directory
+/// means no Claude Code write can be in flight; it is read unlocked.
+pub fn try_read_claude_code_login_locked(
+    files: &ClaudeCodeFiles,
+    store: Option<&AccountStore>,
+) -> Result<Option<ClaudeCodeLogin>> {
+    if matches!(files.backend, CredentialBackend::File)
+        && std::fs::symlink_metadata(&files.credentials)
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(None);
     }
-    let _lock = NativeWriteLock::acquire(files.config_directory())?;
-    read_claude_code_login(files, store)
+    let _lock = match NativeWriteLock::try_acquire(files.config_directory()) {
+        Ok(lock) => Some(lock),
+        Err(LockFailure::Io(std::io::ErrorKind::NotFound)) => None,
+        Err(LockFailure::Busy) => {
+            return Err(link_busy(
+                "Claude Code's credential write lock (.storage-write.lock) stayed held",
+            ));
+        }
+        Err(LockFailure::Io(kind)) => {
+            return Err(link_busy(format!(
+                "Claude Code's credential write lock could not be taken: {kind}"
+            )));
+        }
+    };
+    try_read_claude_code_login(files, store)
 }
 
 /// Whether `account` is linked to Claude Code's login (same account uuid and
@@ -375,55 +485,127 @@ pub enum LinkReconcile {
 
 /// Bring a linked row and Claude Code's login into agreement, newest copy
 /// winning (module docs). Store writes go through [`AccountStore::mutate`]
-/// with compare-and-swap on the row's refresh token; Claude Code's file is
-/// read under its write lock and written only by
+/// with compare-and-swap on the row's refresh token; Claude Code's
+/// credentials are read under its write lock and written only by
 /// [`super::publish_native_login`]. No network.
+///
+/// A row whose identity is Claude Code's account is never judged without
+/// that read: when Claude Code's write lock stays held or the read fails
+/// transiently this returns [`Error::LinkBusy`] (retry later) instead of
+/// [`LinkReconcile::NotLinked`], so no caller goes on to spend or mark dead
+/// a token that a newer Claude Code login may have replaced.
 pub fn reconcile_claude_code_link(
     path: &Path,
     files: &ClaudeCodeFiles,
     account_id: &str,
 ) -> Result<LinkReconcile> {
+    reconcile_link(path, files, account_id).map(|r| r.outcome)
+}
+
+/// [`reconcile_claude_code_link`] and the refresh token Claude Code held when
+/// it was judged (the snapshot a later publish may replace, and nothing
+/// else).
+#[derive(Debug, Clone)]
+pub(crate) struct Reconciled {
+    pub(crate) outcome: LinkReconcile,
+    pub(crate) native_refresh: Option<RefreshToken>,
+}
+
+pub(crate) fn reconcile_link(
+    path: &Path,
+    files: &ClaudeCodeFiles,
+    account_id: &str,
+) -> Result<Reconciled> {
+    let not_linked = Reconciled {
+        outcome: LinkReconcile::NotLinked,
+        native_refresh: None,
+    };
+    // Set when Claude Code's copy changed under a publish: whatever it holds
+    // now was written after this judged the row newer (a `/login`), so it is
+    // adopted, never overwritten.
+    let mut native_changed = false;
     // A row rotated by a peer between the read and the CAS is re-judged.
     for _ in 0..3 {
         let store = AccountStore::read_locked(path, |store| Ok(store.clone()))?;
-        let Some(login) = read_claude_code_login_locked(files, Some(&store)) else {
-            return Ok(LinkReconcile::NotLinked);
+        let login = match try_read_claude_code_login_locked(files, Some(&store)) {
+            Ok(Some(login)) => login,
+            Ok(None) => return Ok(not_linked),
+            Err(busy) => {
+                return if row_may_be_linked(files, &store, account_id) {
+                    Err(busy)
+                } else {
+                    Ok(not_linked)
+                };
+            }
         };
         let Some(account) = store.get(account_id) else {
-            return Ok(LinkReconcile::NotLinked);
+            return Ok(not_linked);
         };
         let Some(row) = account.oauth() else {
-            return Ok(LinkReconcile::NotLinked);
+            return Ok(not_linked);
         };
         if !is_linked(account, &login.identity) {
-            return Ok(LinkReconcile::NotLinked);
+            return Ok(not_linked);
         }
+        let native_refresh = Some(login.tokens.refresh.clone());
         if row.refresh == login.tokens.refresh {
-            return Ok(LinkReconcile::Native {
-                tokens: merged(row, login.tokens),
-                adopted: false,
+            return Ok(Reconciled {
+                outcome: LinkReconcile::Native {
+                    tokens: merged(row, login.tokens),
+                    adopted: false,
+                },
+                native_refresh,
             });
         }
-        if native_wins(account, row, &login.tokens) {
+        if native_changed || native_wins(account, row, &login.tokens) {
             let expected = row.refresh.clone();
             let adopted = AccountStore::mutate(path, |store| {
                 Ok(store.adopt_claude_code_login(account_id, &expected, login.tokens.clone()))
             })?;
             if let Some(tokens) = adopted {
-                return Ok(LinkReconcile::Native {
-                    tokens,
-                    adopted: true,
+                return Ok(Reconciled {
+                    outcome: LinkReconcile::Native {
+                        tokens,
+                        adopted: true,
+                    },
+                    native_refresh,
                 });
             }
             continue;
         }
-        let publish = super::publish_native_login(files, None, row);
-        return Ok(LinkReconcile::Store {
-            tokens: row.clone(),
-            publish,
+        // The row is newer: replace exactly the copy judged older, never one
+        // Claude Code wrote since.
+        let publish =
+            super::publish_native_login_guarded(files, None, Some(&login.tokens.refresh), row);
+        if publish == NativePublishOutcome::NotHeld {
+            native_changed = true;
+            continue;
+        }
+        return Ok(Reconciled {
+            outcome: LinkReconcile::Store {
+                tokens: row.clone(),
+                publish,
+            },
+            native_refresh,
         });
     }
-    Ok(LinkReconcile::NotLinked)
+    Ok(not_linked)
+}
+
+/// Whether `account_id` may be Claude Code's account although its
+/// credentials could not be read: `.claude.json` names the row's account, or
+/// (without one) an unlocked read finds a login linked to it.
+fn row_may_be_linked(files: &ClaudeCodeFiles, store: &AccountStore, account_id: &str) -> bool {
+    let Some(account) = store.get(account_id) else {
+        return false;
+    };
+    if let Some(identity) = read_claude_code_identity(&files.config) {
+        return is_linked(account, &identity);
+    }
+    try_read_claude_code_login(files, Some(store))
+        .ok()
+        .flatten()
+        .is_some_and(|login| is_linked(account, &login.identity))
 }
 
 /// `native` with the row's metadata where Claude Code's file has none.
@@ -883,6 +1065,169 @@ mod tests {
             .set_modified(std::time::SystemTime::now() - Duration::minutes(5).to_std().unwrap())
             .unwrap();
         assert!(ClaudeCodeRefreshLock::acquire(&files).is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_guarded_publish_replaces_only_the_copy_it_judged() {
+        let dir = temp_dir("guarded");
+        let rotated = tokens("store", Utc::now() + Duration::hours(2), true);
+        // Claude Code's copy is older than the rotation, but it is not the
+        // one judged moments ago: a `/login` wrote it since. Left alone.
+        let relogin = tokens("native-relogin", Utc::now() + Duration::minutes(30), false);
+        let files = native(&dir, &relogin, Some((ACCOUNT, ORG)));
+        let before = std::fs::read(&files.credentials).unwrap();
+        let judged = RefreshToken::new("sk-ant-ort01-judged-aaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(
+            super::super::publish_native_login_guarded(&files, None, Some(&judged), &rotated),
+            NativePublishOutcome::NotHeld
+        );
+        assert_eq!(std::fs::read(&files.credentials).unwrap(), before);
+        // The judged copy itself is replaced, whatever its expiry.
+        let longer = tokens("native-judged", Utc::now() + Duration::hours(9), false);
+        let files = native(&dir, &longer, Some((ACCOUNT, ORG)));
+        assert_eq!(
+            super::super::publish_native_login_guarded(
+                &files,
+                None,
+                Some(&longer.refresh),
+                &rotated
+            ),
+            NativePublishOutcome::Written
+        );
+        // Never for another account.
+        let files = native(&dir, &longer, Some(("acct-someone-else", ORG)));
+        assert_eq!(
+            super::super::publish_native_login_guarded(
+                &files,
+                None,
+                Some(&longer.refresh),
+                &rotated
+            ),
+            NativePublishOutcome::OtherAccount
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_busy_lock_is_link_busy_for_the_linked_row_only() {
+        let dir = temp_dir("busy");
+        let row = tokens("store-busy", Utc::now() - Duration::hours(1), true);
+        let path = store_with(&dir, row);
+        let native_tokens = tokens("native-busy", Utc::now() + Duration::hours(4), false);
+        let files = native(&dir, &native_tokens, Some((ACCOUNT, ORG)));
+        let lock = dir.join(super::super::NATIVE_WRITE_LOCK_NAME);
+        std::fs::create_dir(&lock).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let keeper = {
+            let (lock, stop) = (lock.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    if let Ok(dir) = std::fs::File::open(&lock) {
+                        let _ = dir.set_modified(std::time::SystemTime::now());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            })
+        };
+        match reconcile_claude_code_link(&path, &files, "me") {
+            Err(Error::LinkBusy {
+                reason,
+                retry_after_ms,
+            }) => {
+                assert!(reason.contains("storage-write"), "{reason}");
+                assert_eq!(retry_after_ms, LINK_BUSY_RETRY_AFTER_MS);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            try_read_claude_code_login_locked(&files, None),
+            Err(Error::LinkBusy { .. })
+        ));
+        assert!(read_claude_code_login_locked(&files, None).is_none());
+        // Claude Code logged into another account: not this row's business.
+        let other = native(&dir, &native_tokens, Some(("acct-someone-else", ORG)));
+        assert!(matches!(
+            reconcile_claude_code_link(&path, &other, "me").unwrap(),
+            LinkReconcile::NotLinked
+        ));
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        keeper.join().unwrap();
+        std::fs::remove_dir(&lock).unwrap();
+        // No config dir at all: nothing can be mid-write; an unlocked read.
+        let missing = ClaudeCodeFiles::for_credentials(&dir.join("nope").join(".credentials.json"));
+        assert!(matches!(
+            try_read_claude_code_login_locked(&missing, None),
+            Ok(None)
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_keychain_backend_reads_a_login_and_keeps_unknown_keys_on_publish() {
+        use crate::credentials::source::tests::{item, seed, stored};
+        let dir = temp_dir("keychain-link");
+        let item = item(&dir);
+        let files = ClaudeCodeFiles::for_credentials(&dir.join(".credentials.json"))
+            .with_backend(CredentialBackend::Keychain(item.clone()));
+        write_private(
+            &files.config,
+            &serde_json::json!({
+                "oauthAccount": { "accountUuid": ACCOUNT, "organizationUuid": ORG }
+            }),
+        );
+        // No item: no login, and a publish never creates one.
+        assert!(try_read_claude_code_login(&files, None).unwrap().is_none());
+        let rotated = tokens("kc-rotated", Utc::now() + Duration::hours(8), true);
+        assert_eq!(
+            super::super::publish_native_login(&files, None, &rotated),
+            NativePublishOutcome::Absent
+        );
+        assert!(stored(&dir, &item).is_none());
+        let old = tokens("kc-old", Utc::now() + Duration::hours(1), false);
+        seed(
+            &dir,
+            &item,
+            &serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": old.access.expose(),
+                    "refreshToken": old.refresh.expose(),
+                    "expiresAt": old.expires_at.timestamp_millis(),
+                    "scopes": ["user:inference"],
+                    "rateLimitTier": "tier"
+                },
+                "trustedDeviceToken": "keep-me"
+            })
+            .to_string(),
+        );
+        let login = try_read_claude_code_login_locked(&files, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(login.tokens.refresh, old.refresh);
+        assert_eq!(login.identity.account_uuid, ACCOUNT);
+        assert_eq!(
+            super::super::publish_native_login(&files, None, &rotated),
+            NativePublishOutcome::Written
+        );
+        let doc: serde_json::Value = serde_json::from_str(&stored(&dir, &item).unwrap()).unwrap();
+        assert_eq!(
+            doc["claudeAiOauth"]["refreshToken"],
+            rotated.refresh.expose()
+        );
+        assert_eq!(doc["claudeAiOauth"]["rateLimitTier"], "tier");
+        assert_eq!(doc["trustedDeviceToken"], "keep-me");
+        assert!(!files.credentials.exists(), "never falls back to a file");
+        assert!(!dir.join(super::super::NATIVE_WRITE_LOCK_NAME).exists());
+        // `security` failing: transient, never "no login".
+        std::fs::write(dir.join("mode"), "fail").unwrap();
+        assert!(matches!(
+            try_read_claude_code_login(&files, None),
+            Err(Error::LinkBusy { .. })
+        ));
+        assert!(matches!(
+            super::super::publish_native_login(&files, None, &rotated),
+            NativePublishOutcome::Failed(_)
+        ));
         let _ = std::fs::remove_dir_all(dir);
     }
 }
