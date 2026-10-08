@@ -218,7 +218,18 @@ impl AccountStore {
     ///
     /// Refuses to follow a symlink: a store path that became a symlink is a
     /// tampering signal, not something to silently read through.
+    ///
+    /// A rotation a refresh could not save (see [`crate::unsaved`]) is
+    /// applied: a row still holding the spent refresh token holds the
+    /// rotation in the returned store.
     pub fn load(path: &Path) -> Result<Self> {
+        let mut store = Self::load_file(path)?;
+        crate::unsaved::apply(path, &mut store);
+        Ok(store)
+    }
+
+    /// The store file as written, without unsaved rotations applied.
+    pub(crate) fn load_file(path: &Path) -> Result<Self> {
         let raw = crate::file_security::read_bounded_regular(
             path,
             STORE_MAX_BYTES,
@@ -371,7 +382,7 @@ impl AccountStore {
         update: impl FnOnce(&mut Self) -> Result<R>,
     ) -> Result<R> {
         let _lock = StoreLock::acquire(path, STORE_LOCK_WAIT)?;
-        let mut store = Self::load_if_present(path)?;
+        let (mut store, unsaved) = Self::load_if_present(path)?;
         // Stale errors (bound to a token the row no longer holds, or an
         // unbound `invalid_grant` with no dead-token record) clear themselves
         // on the next locked write, whoever makes it.
@@ -380,13 +391,23 @@ impl AccountStore {
         }
         let output = update(&mut store)?;
         store.save_unlocked(path, allow_empty)?;
+        // The unsaved rotations applied on load are in the file now.
+        crate::unsaved::settle(path, &unsaved, &store);
         Ok(output)
     }
 
-    fn load_if_present(path: &Path) -> Result<Self> {
+    /// The store at `path` (empty when there is none) with the unsaved
+    /// rotations applied, and the records seen.
+    fn load_if_present(path: &Path) -> Result<(Self, Vec<crate::unsaved::Seen>)> {
         match std::fs::symlink_metadata(path) {
-            Ok(_) => Self::load(path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Ok(_) => {
+                let mut store = Self::load_file(path)?;
+                let unsaved = crate::unsaved::apply(path, &mut store);
+                Ok((store, unsaved))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok((Self::default(), Vec::new()))
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -397,7 +418,7 @@ impl AccountStore {
     /// needs to change.
     pub fn read_locked<R>(path: &Path, read: impl FnOnce(&Self) -> Result<R>) -> Result<R> {
         let _lock = StoreLock::acquire(path, STORE_LOCK_WAIT)?;
-        let store = Self::load_if_present(path)?;
+        let (store, _) = Self::load_if_present(path)?;
         read(&store)
     }
 

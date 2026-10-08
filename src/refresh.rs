@@ -101,6 +101,12 @@ pub struct SharedRefreshOutcome {
     /// `None` when this call did not rotate the token itself, or the
     /// publish is off or suppressed by OAuth test mode.
     pub native_publish: Option<NativePublishOutcome>,
+    /// Why this call's rotation is not in the store file yet (secret-free):
+    /// the commit failed after the token endpoint rotated the token, so the
+    /// rotation was kept beside the store instead ([`crate::unsaved`]) and
+    /// the next write of the store persists it. `None` when it was
+    /// committed, or this call did not rotate.
+    pub unsaved: Option<String>,
 }
 
 /// Tunables for [`OAuthClient::refresh_shared`].
@@ -313,6 +319,7 @@ impl OAuthClient {
                     source: RefreshSource::AdoptedPeer,
                     account_id: Some(account_id),
                     native_publish: None,
+                    unsaved: None,
                 });
             }
             // The caller's token is stale and the store's session has expired
@@ -328,6 +335,7 @@ impl OAuthClient {
                     source: RefreshSource::AdoptedShared,
                     account_id,
                     native_publish: None,
+                    unsaved: None,
                 });
             }
             Located::Unknown => {
@@ -362,6 +370,7 @@ impl OAuthClient {
                     source: RefreshSource::Refreshed,
                     account_id: None,
                     native_publish,
+                    unsaved: None,
                 });
             }
         };
@@ -405,6 +414,7 @@ impl OAuthClient {
                         source: RefreshSource::AdoptedPeer,
                         account_id: Some(account_id.to_owned()),
                         native_publish: None,
+                        unsaved: None,
                     });
                 }
                 RefreshClaim::DeadToken => {
@@ -482,13 +492,48 @@ impl OAuthClient {
             Ok(Err(error)) => return Err(error),
             Err(_) => return Err(Error::Timeout("oauth token refresh".into())),
         };
-        let committed = AccountStore::commit_refresh_at(
+        let committed = match AccountStore::commit_refresh_at(
             path,
             account_id,
             &spend.refresh,
             Some(lease_id),
             refreshed.clone(),
-        )?;
+        ) {
+            Ok(committed) => committed,
+            Err(error) => {
+                // The endpoint already rotated the token: the spent one is
+                // dead, and the rotation is the account. It is handed back,
+                // never presented again from here, and kept for every
+                // reader of the store until a write of the store lands. The
+                // claim is left to lapse, so a reader that does not know
+                // the record waits instead of spending the token.
+                DeadRefreshTokens::remember(spend.refresh.expose());
+                let unsaved = match crate::unsaved::keep(
+                    path,
+                    account_id,
+                    &spend.refresh,
+                    &refreshed,
+                ) {
+                    Ok(()) => format!(
+                        "the refreshed login could not be saved to the account store ({error}); it was kept beside the store until the next write"
+                    ),
+                    Err(record) => format!(
+                        "the refreshed login could not be saved to the account store ({error}) or beside it ({record}); only this process holds it"
+                    ),
+                };
+                let native_before = link.and_then(|l| l.native_before.as_ref());
+                let native_publish = self
+                    .publish_native(&spend.refresh, &refreshed, native_before)
+                    .await;
+                return Ok(SharedRefreshOutcome {
+                    tokens: refreshed,
+                    source: RefreshSource::Refreshed,
+                    account_id: Some(account_id.to_owned()),
+                    native_publish,
+                    unsaved: Some(unsaved),
+                });
+            }
+        };
         if committed {
             let native_before = link.and_then(|l| l.native_before.as_ref());
             let native_publish = self
@@ -499,6 +544,7 @@ impl OAuthClient {
                 source: RefreshSource::Refreshed,
                 account_id: Some(account_id.to_owned()),
                 native_publish,
+                unsaved: None,
             });
         }
         let winner = AccountStore::load_or_migrate_from(path, &[])
@@ -527,6 +573,7 @@ impl OAuthClient {
             source: RefreshSource::AdoptedWinner,
             account_id: Some(account_id.to_owned()),
             native_publish: None,
+            unsaved: None,
         })
     }
 
@@ -659,6 +706,7 @@ impl OAuthClient {
                                 source: RefreshSource::ClaudeCode,
                                 account_id: Some(account_id.to_owned()),
                                 native_publish: outcome.native_publish,
+                                unsaved: None,
                             }));
                         }
                         // Adopted but already inside the leeway: spend it
@@ -818,6 +866,7 @@ fn borrowed(
         source,
         account_id: Some(account_id.to_owned()),
         native_publish,
+        unsaved: None,
     })
 }
 
@@ -1013,6 +1062,16 @@ mod tests {
     /// A token endpoint that answers every request with the same status/body
     /// and counts presentations.
     async fn token_server(status: u16, body: &'static str) -> (String, Arc<AtomicUsize>) {
+        token_server_then(status, body, Arc::new(|| {})).await
+    }
+
+    /// [`token_server`] that runs `on_request` on each request before it
+    /// answers (while the caller's refresh is in flight).
+    async fn token_server_then(
+        status: u16,
+        body: &'static str,
+        on_request: Arc<dyn Fn() + Send + Sync>,
+    ) -> (String, Arc<AtomicUsize>) {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -1025,6 +1084,7 @@ mod tests {
                     break;
                 };
                 let counter = counter.clone();
+                let on_request = on_request.clone();
                 tokio::spawn(async move {
                     let mut request = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -1052,6 +1112,7 @@ mod tests {
                         }
                     }
                     counter.fetch_add(1, Ordering::SeqCst);
+                    on_request();
                     let reason = if status == 200 { "OK" } else { "Bad Request" };
                     let response = format!(
                         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -1196,6 +1257,95 @@ mod tests {
         assert_eq!(again.source, RefreshSource::AdoptedShared);
         assert_eq!(again.tokens.refresh.expose(), NEW_REFRESH);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// While the refresh is in flight the store becomes unwritable for the
+    /// commit (a symlink, which every store read and write refuses); the
+    /// returned guard puts the file back.
+    #[cfg(unix)]
+    fn break_store_during_refresh(path: &Path) -> Arc<dyn Fn() + Send + Sync> {
+        let path = path.to_path_buf();
+        Arc::new(move || {
+            let aside = path.with_file_name("accounts.aside.json");
+            std::fs::rename(&path, &aside).unwrap();
+            std::os::unix::fs::symlink(&aside, &path).unwrap();
+        })
+    }
+
+    #[cfg(unix)]
+    fn mend_store(path: &Path) {
+        std::fs::remove_file(path).unwrap();
+        std::fs::rename(path.with_file_name("accounts.aside.json"), path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rotation_the_store_cannot_save_is_kept_not_lost() {
+        const TAG: &str = "unsaved";
+        let path = store_path(TAG);
+        let presented = old_tokens(TAG);
+        seeded_store(&path, &presented);
+        let (url, hits) =
+            token_server_then(200, ROTATED_BODY, break_store_during_refresh(&path)).await;
+
+        let outcome = client(&url)
+            .refresh_shared(&path, &presented, &SharedRefreshOptions::default())
+            .await
+            .unwrap();
+        mend_store(&path);
+
+        // The rotation is the caller's: the spent token is dead.
+        assert_eq!(outcome.source, RefreshSource::Refreshed);
+        assert_eq!(outcome.tokens.refresh.expose(), NEW_REFRESH);
+        let reason = outcome.unsaved.expect("the rotation is reported unsaved");
+        assert!(!reason.contains("sk-ant"), "{reason}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            crate::unsaved::unsaved_accounts(&path),
+            vec!["shared".to_string()]
+        );
+
+        // Another process (it never saw this one's memory) reads the store
+        // with the rotation applied, so it never presents the spent token.
+        crate::unsaved::forget_kept(&path);
+        let seen = AccountStore::load(&path).unwrap();
+        assert_eq!(
+            seen.get("shared")
+                .unwrap()
+                .oauth()
+                .unwrap()
+                .refresh
+                .expose(),
+            NEW_REFRESH
+        );
+        let again = client(&url)
+            .refresh_shared(&path, &presented, &SharedRefreshOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(again.tokens.refresh.expose(), NEW_REFRESH);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // The next write of the store persists it and clears the record.
+        AccountStore::mutate(&path, |_| Ok(())).unwrap();
+        assert_eq!(
+            AccountStore::load_file(&path)
+                .unwrap()
+                .get("shared")
+                .unwrap()
+                .oauth()
+                .unwrap()
+                .refresh
+                .expose(),
+            NEW_REFRESH
+        );
+        assert!(crate::unsaved::unsaved_accounts(&path).is_empty());
+        let records = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".unsaved-"))
+            .count();
+        assert_eq!(records, 0);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

@@ -100,6 +100,8 @@ pub mod revoke;
 pub mod routing;
 #[cfg(feature = "store")]
 pub mod store;
+#[cfg(feature = "store")]
+pub mod unsaved;
 
 // Auth/quota/routing slice (anthropic-auth b504bc8 + fork 33f12b2).
 pub mod backoff;
