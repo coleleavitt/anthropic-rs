@@ -904,20 +904,37 @@ fn start_lease_heartbeat(
     (stop, heartbeat)
 }
 
+/// Whether the lease at `path` is abandoned: its heartbeat (the file's
+/// mtime) is older than `lease_ms` and, for a cross-language lease, its
+/// expiry has passed too.
+///
+/// A lease this crate wrote (it records the holder's `pid`) is kept alive by
+/// [`start_lease_heartbeat`] alone; its `expiresAt` is written once and never
+/// renewed. A holder that dies inside the lock (killed, or its process
+/// exiting while another thread writes the store) leaves the lease behind
+/// with that expiry up to 30 s away. Honouring it kept every store reader
+/// and writer on the machine waiting long after the heartbeat stopped (the
+/// first of them holding the flock while it waits, so the others time out
+/// on the lock), so such a lease lapses with its heartbeat.
 fn lease_is_stale(path: &Path, now: u128, lease_ms: u128) -> bool {
-    let expires = std::fs::read_to_string(path)
+    let lease = std::fs::read_to_string(path)
         .ok()
-        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok());
+    let expires = lease
+        .as_ref()
         .and_then(|value| value.get("expiresAt")?.as_u64())
         .map(u128::from);
+    let heartbeated = lease
+        .as_ref()
+        .is_some_and(|value| value.get("pid").is_some());
     let old_heartbeat = std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| modified.elapsed().ok())
         .is_some_and(|age| age.as_millis() >= lease_ms);
     match expires {
-        Some(expires) => expires <= now && old_heartbeat,
-        None => old_heartbeat,
+        Some(expires) if !heartbeated => expires <= now && old_heartbeat,
+        Some(_) | None => old_heartbeat,
     }
 }
 
@@ -1346,6 +1363,43 @@ mod tests {
         store_with(&["a"]).save(&path).unwrap();
         assert!(!lock.exists());
         assert_eq!(AccountStore::load(&path).unwrap().accounts.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_lease_left_by_a_killed_holder_lapses_with_its_heartbeat() {
+        // A holder killed inside the lock (SIGKILL, or the process exiting
+        // while another of its threads writes the store): the kernel drops
+        // its flock, its lease stays, and the lease's expiry is still 30 s
+        // out. Its heartbeat stopped when it died.
+        let dir = tmp_dir("killed-holder-lease");
+        let path = dir.join("accounts.json");
+        store_with(&["a"]).save(&path).unwrap();
+        let lock = dir.join("accounts.json.lock");
+        std::fs::write(
+            &lock,
+            format!(
+                "{{\"ownerId\":\"killed\",\"pid\":4242,\"expiresAt\":{}}}\n",
+                unix_time_millis() + 30_000
+            ),
+        )
+        .unwrap();
+        let last_heartbeat = std::time::SystemTime::now() - Duration::from_secs(11);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(last_heartbeat))
+            .unwrap();
+
+        AccountStore::mutate(&path, |store| {
+            store.upsert(account("b"));
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(!lock.exists());
+        assert_eq!(AccountStore::load(&path).unwrap().accounts.len(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
