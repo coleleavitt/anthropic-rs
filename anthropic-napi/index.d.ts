@@ -207,8 +207,8 @@ export interface KeepAliveEntry {
 }
 
 export interface KeepAliveResult {
-  /** `acquired`: this pass did the work; `held`: another pass holds the machine-wide lease. */
-  lease: 'acquired' | 'held' | 'no_store'
+  /** `acquired`: this pass did the work; `held`: another pass holds the machine-wide lease; `nothing_due`: no account was due (the store lock was not taken). */
+  lease: 'acquired' | 'held' | 'nothing_due' | 'no_store'
   heldUntil?: number
   refreshed: KeepAliveEntry[]
   adopted: string[]

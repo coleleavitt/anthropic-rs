@@ -11,7 +11,8 @@
 //! - **One owner per machine.** A pass runs only while it holds the store's
 //!   top-level keep-alive lease ([`KeepAliveLease`], written under the store
 //!   lock, with a TTL so a crashed owner does not wedge it). A second caller
-//!   that finds the lease held does nothing.
+//!   that finds the lease held does nothing. A pass that finds no account
+//!   due (read without the store lock) takes neither the lease nor the lock.
 //! - **Only accounts that need it.** An account is refreshed when it has no
 //!   access token, or its refresh token expires within a threshold (default
 //!   7 days), or (when known) its last successful refresh is older than a
@@ -272,6 +273,8 @@ pub enum KeepAliveLeaseOutcome {
     },
     /// There is no store file; nothing to keep alive.
     NoStore,
+    /// No row was due (read without the store lock); nothing was done.
+    NothingDue,
 }
 
 /// One failed keep-alive refresh.
@@ -329,6 +332,27 @@ impl crate::oauth::OAuthClient {
 
         if std::fs::symlink_metadata(path).is_err() {
             return Ok(KeepAliveReport::empty(KeepAliveLeaseOutcome::NoStore));
+        }
+        // Most passes find nothing due. That is decided without the store
+        // lock, so such a pass neither waits behind the store's writers
+        // (each of them syncs the store to disk under the lock) nor writes
+        // the lease twice for nothing. A row that falls due after this read
+        // is the next pass's; a due row goes through the lease and the
+        // claimed refresh below as before.
+        let preview = AccountStore::load(path)?;
+        let skipped: Vec<(String, KeepAliveSkip)> = preview
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                keepalive_verdict(account, now, options)
+                    .err()
+                    .map(|skip| (account.id.clone(), skip))
+            })
+            .collect();
+        if skipped.len() == preview.accounts.len() {
+            let mut report = KeepAliveReport::empty(KeepAliveLeaseOutcome::NothingDue);
+            report.skipped = skipped;
+            return Ok(report);
         }
         let owner = uuid::Uuid::new_v4().to_string();
         let claim = AccountStore::mutate(path, |store| {
@@ -909,6 +933,56 @@ mod tests {
             );
             assert_eq!(std::fs::read(&credentials).unwrap(), before);
             std::fs::remove_dir_all(dir).ok();
+        }
+
+        #[tokio::test]
+        async fn a_pass_with_nothing_due_does_not_wait_for_the_store_lock() {
+            let (url, seen) = rotating_server(std::time::Duration::ZERO).await;
+            let path = store_path("nothing-due");
+            AccountStore {
+                accounts: vec![
+                    real_row("in-use", Duration::hours(4), Duration::days(2)),
+                    real_row("healthy", Duration::hours(-1), Duration::days(25)),
+                ],
+                ..AccountStore::default()
+            }
+            .save(&path)
+            .unwrap();
+            // A peer holds the store lock past every waiter's wait (a write
+            // stalled on a loaded disk).
+            let (held, holding) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let holder = {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    AccountStore::mutate(&path, |_| {
+                        held.send(()).unwrap();
+                        released.recv().unwrap();
+                        Ok(())
+                    })
+                })
+            };
+            holding.recv().unwrap();
+
+            let report = client(&url)
+                .keep_alive_once(&path, Utc::now(), &fast())
+                .await
+                .unwrap();
+            release.send(()).unwrap();
+            holder.join().unwrap().unwrap();
+
+            assert_eq!(report.lease, KeepAliveLeaseOutcome::NothingDue);
+            assert_eq!(
+                report.skipped,
+                vec![
+                    ("in-use".to_owned(), KeepAliveSkip::SessionLive),
+                    ("healthy".to_owned(), KeepAliveSkip::NotDue),
+                ]
+            );
+            assert!(report.refreshed.is_empty() && report.failed.is_empty());
+            assert!(seen.lock().unwrap().is_empty());
+            assert!(AccountStore::load(&path).unwrap().keepalive.is_none());
+            std::fs::remove_dir_all(path.parent().unwrap()).ok();
         }
 
         #[tokio::test]

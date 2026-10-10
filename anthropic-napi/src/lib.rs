@@ -359,7 +359,8 @@ pub struct KeepAliveEntry {
 #[napi(object)]
 pub struct KeepAliveResult {
     /// `"acquired"` (this pass did the work), `"held"` (another pass holds
-    /// the machine-wide lease; nothing done) or `"no_store"`.
+    /// the machine-wide lease; nothing done), `"nothing_due"` (no account
+    /// was due; the store lock was not taken) or `"no_store"`.
     pub lease: String,
     /// When the other pass's lease lapses (epoch ms), for `"held"`.
     pub held_until: Option<i64>,
@@ -1113,6 +1114,7 @@ impl AnthropicAuth {
             KeepAliveLeaseOutcome::Acquired => ("acquired", None),
             KeepAliveLeaseOutcome::Held { until, .. } => ("held", Some(ms(until))),
             KeepAliveLeaseOutcome::NoStore => ("no_store", None),
+            KeepAliveLeaseOutcome::NothingDue => ("nothing_due", None),
         };
         Ok(KeepAliveResult {
             lease: lease.into(),
