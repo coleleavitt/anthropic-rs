@@ -491,6 +491,96 @@ pub fn next_retry_delay_ms(
     retry_after_ms(headers, now_unix_ms).unwrap_or_else(|| backoff_delay_ms(attempt, random))
 }
 
+/// Error codes Claude Code treats as a stale connection (2.1.296 `kz`): the
+/// pooled connection the request went out on was dead, so the retry must use
+/// a fresh one (the CLI turns keep-alive off and rebuilds its client).
+pub const STALE_CONNECTION_CODES: [&str; 9] = [
+    "ECONNRESET",
+    "EPIPE",
+    "ConnectionClosed",
+    "UND_ERR_SOCKET",
+    "ETIMEDOUT",
+    "ECONNABORTED",
+    "ERR_SOCKET_CLOSED",
+    "StreamSuspended",
+    "StreamTruncated",
+];
+
+/// TLS certificate failures Claude Code never retries (2.1.296 `Hue`): the
+/// same certificate is rejected again.
+pub const CERTIFICATE_ERROR_CODES: [&str; 15] = [
+    "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+    "UNABLE_TO_GET_ISSUER_CERT",
+    "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+    "CERT_SIGNATURE_FAILURE",
+    "CERT_NOT_YET_VALID",
+    "CERT_HAS_EXPIRED",
+    "CERT_REVOKED",
+    "CERT_REJECTED",
+    "CERT_UNTRUSTED",
+    "DEPTH_ZERO_SELF_SIGNED_CERT",
+    "SELF_SIGNED_CERT_IN_CHAIN",
+    "CERT_CHAIN_TOO_LONG",
+    "PATH_LENGTH_EXCEEDED",
+    "ERR_TLS_CERT_ALTNAME_INVALID",
+    "HOSTNAME_MISMATCH",
+];
+
+/// Codes of connection failures that are deterministic for the request, not
+/// the network (2.1.296 `khr`).
+const NON_RETRYABLE_CONNECTION_CODES: [&str; 2] =
+    ["BedrockUnexpectedContentType", "TestEgressBlocked"];
+
+/// What to do with a request that produced no response (an
+/// `APIConnectionError`), by its cause's error code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionRetry {
+    /// Surface the failure: re-sending meets the same rejection.
+    Never,
+    /// Re-send through the same client after the usual backoff.
+    Retry,
+    /// Re-send on a fresh connection: the pooled one was stale.
+    RetryFresh,
+}
+
+/// Claude Code's decision for a connection error (2.1.296 `khr` for the
+/// retry, `shr` for the fresh connection): every connection failure retries
+/// except a certificate rejection and the deterministic codes, whatever
+/// `x-should-retry` would say (no response carries one); a stale-connection
+/// code retries on a fresh connection.
+pub fn classify_connection_error(code: Option<&str>) -> ConnectionRetry {
+    let Some(code) = code else {
+        return ConnectionRetry::Retry;
+    };
+    if CERTIFICATE_ERROR_CODES.contains(&code) || NON_RETRYABLE_CONNECTION_CODES.contains(&code) {
+        ConnectionRetry::Never
+    } else if STALE_CONNECTION_CODES.contains(&code) {
+        ConnectionRetry::RetryFresh
+    } else {
+        ConnectionRetry::Retry
+    }
+}
+
+/// The Node error code a socket failure surfaces as, for
+/// [`classify_connection_error`]; `None` for kinds with no Node code the
+/// policy distinguishes.
+pub fn io_error_code(kind: std::io::ErrorKind) -> Option<&'static str> {
+    use std::io::ErrorKind;
+    Some(match kind {
+        ErrorKind::ConnectionReset => "ECONNRESET",
+        ErrorKind::BrokenPipe => "EPIPE",
+        ErrorKind::ConnectionAborted => "ECONNABORTED",
+        ErrorKind::TimedOut => "ETIMEDOUT",
+        // A socket that ended before the response: bun's `ConnectionClosed`.
+        ErrorKind::UnexpectedEof | ErrorKind::NotConnected => "ConnectionClosed",
+        ErrorKind::ConnectionRefused => "ECONNREFUSED",
+        ErrorKind::HostUnreachable => "EHOSTUNREACH",
+        ErrorKind::NetworkUnreachable => "ENETUNREACH",
+        ErrorKind::NetworkDown => "ENETDOWN",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,5 +884,76 @@ mod provider_verdict_tests {
             RetryAfter401Reason::ReauthorizeFailed.as_str(),
             "reauthorize-failed"
         );
+    }
+}
+
+#[cfg(test)]
+mod connection_retry_tests {
+    //! The connection-error half of Claude Code 2.1.296's retry policy.
+    use super::*;
+
+    #[test]
+    fn stale_connections_retry_on_a_fresh_connection() {
+        for code in STALE_CONNECTION_CODES {
+            assert_eq!(
+                classify_connection_error(Some(code)),
+                ConnectionRetry::RetryFresh,
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn certificate_rejections_and_deterministic_codes_never_retry() {
+        for code in CERTIFICATE_ERROR_CODES
+            .iter()
+            .chain(NON_RETRYABLE_CONNECTION_CODES.iter())
+        {
+            assert_eq!(
+                classify_connection_error(Some(code)),
+                ConnectionRetry::Never,
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_other_connection_failure_retries_on_the_same_client() {
+        for code in [
+            None,
+            Some("ECONNREFUSED"),
+            Some("ENOTFOUND"),
+            Some("EAI_AGAIN"),
+            Some("ENETUNREACH"),
+        ] {
+            assert_eq!(
+                classify_connection_error(code),
+                ConnectionRetry::Retry,
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn socket_failures_map_to_the_codes_the_policy_reads() {
+        use std::io::ErrorKind;
+        let cases = [
+            (ErrorKind::ConnectionReset, ConnectionRetry::RetryFresh),
+            (ErrorKind::BrokenPipe, ConnectionRetry::RetryFresh),
+            (ErrorKind::ConnectionAborted, ConnectionRetry::RetryFresh),
+            (ErrorKind::TimedOut, ConnectionRetry::RetryFresh),
+            (ErrorKind::UnexpectedEof, ConnectionRetry::RetryFresh),
+            (ErrorKind::NotConnected, ConnectionRetry::RetryFresh),
+            (ErrorKind::ConnectionRefused, ConnectionRetry::Retry),
+            (ErrorKind::NetworkUnreachable, ConnectionRetry::Retry),
+            (ErrorKind::Other, ConnectionRetry::Retry),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(
+                classify_connection_error(io_error_code(kind)),
+                expected,
+                "{kind:?}"
+            );
+        }
     }
 }

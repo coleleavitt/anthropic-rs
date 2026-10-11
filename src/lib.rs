@@ -210,7 +210,14 @@ pub use refresh::{DeadRefreshTokens, RefreshSource, SharedRefreshOptions, Shared
 #[cfg(feature = "store")]
 pub use refresh_claim::RefreshClaim;
 pub use request::HeaderMutation;
-pub use retry::{CredentialReceipt, RetryAfter401, decide_retry_after_401};
+pub use retry::{
+    ConnectionRetry,
+    CredentialReceipt,
+    RetryAfter401,
+    classify_connection_error,
+    decide_retry_after_401,
+    io_error_code,
+};
 #[cfg(feature = "store")]
 pub use sticky_routing::StickySessionRouter;
 pub use sticky_routing::{RoutingMode, StickyRouteFamily};
