@@ -1,9 +1,13 @@
 {
   "name": "@coleleavitt/anthropic-napi",
   "version": "0.1.0",
-  "private": true,
   "description": "Node/Bun binding over the anthropic shared account store; refresh tokens stay in Rust",
   "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/coleleavitt/anthropic-rs.git",
+    "directory": "anthropic-napi"
+  },
   "main": "index.js",
   "types": "index.d.ts",
   "files": [

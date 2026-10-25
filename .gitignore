@@ -11,3 +11,4 @@
 # napi build outputs
 /anthropic-napi/*.node
 /anthropic-napi/node_modules/
+/anthropic-napi/*.tgz
