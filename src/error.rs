@@ -402,4 +402,151 @@ mod tests {
         assert!(!endpoint(500, Some("invalid_grant"), "").is_invalid_grant());
         assert!(!Error::Timeout("refresh".into()).is_permanent());
     }
+
+    #[test]
+    fn revocation_origin_names_each_source() {
+        assert_eq!(
+            RevocationOrigin::Endpoint {
+                status: 400,
+                error_code: Some("invalid_grant".into()),
+            }
+            .to_string(),
+            "token endpoint answered HTTP 400 invalid_grant"
+        );
+        assert_eq!(
+            RevocationOrigin::Endpoint {
+                status: 400,
+                error_code: None,
+            }
+            .to_string(),
+            "token endpoint answered HTTP 400 without an error code"
+        );
+        assert_eq!(
+            RevocationOrigin::LocalDeadSet.to_string(),
+            "already rejected earlier in this process"
+        );
+        assert_eq!(
+            RevocationOrigin::DeadTokenClaim.to_string(),
+            "the shared store records this token as dead"
+        );
+    }
+
+    #[test]
+    fn is_permanent_separates_terminal_from_retryable_failures() {
+        // A permanent endpoint failure (bad request) vs a transient one (5xx).
+        assert!(endpoint(400, Some("invalid_request"), "").is_permanent());
+        assert!(
+            !Error::Endpoint {
+                status: 503,
+                permanent: false,
+                error_code: None,
+                retry_after_ms: None,
+                body: String::new(),
+            }
+            .is_permanent()
+        );
+        // Terminal classes: re-auth / configuration / unknown account.
+        for terminal in [
+            Error::StateMismatch,
+            Error::RefreshTokenExpired,
+            Error::RefreshTokenRevoked {
+                origin: RevocationOrigin::LocalDeadSet,
+            },
+            Error::MalformedTokenResponse("access_token"),
+            Error::WouldDeleteAllAccounts,
+            Error::StoreIsSymlink,
+            Error::UnknownAccount("acct".into()),
+        ] {
+            assert!(terminal.is_permanent(), "{terminal:?} should be permanent");
+        }
+        // Retryable classes: contention / I/O / transient refusals.
+        for retryable in [
+            Error::Timeout("refresh".into()),
+            Error::RefreshRefused("in flight".into()),
+            Error::NoUsableAccount("all rate-limited".into()),
+            Error::LinkBusy {
+                reason: "lock held".into(),
+                retry_after_ms: 500,
+            },
+        ] {
+            assert!(
+                !retryable.is_permanent(),
+                "{retryable:?} should be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_ms_reads_the_server_cooldown_or_the_link_backoff() {
+        assert_eq!(
+            Error::Endpoint {
+                status: 429,
+                permanent: false,
+                error_code: None,
+                retry_after_ms: Some(1_500),
+                body: String::new(),
+            }
+            .retry_after_ms(),
+            Some(1_500)
+        );
+        assert_eq!(
+            Error::LinkBusy {
+                reason: "lock held".into(),
+                retry_after_ms: 750,
+            }
+            .retry_after_ms(),
+            Some(750)
+        );
+        assert_eq!(endpoint(400, None, "").retry_after_ms(), None);
+        assert_eq!(Error::Timeout("x".into()).retry_after_ms(), None);
+    }
+
+    #[test]
+    fn rate_limited_and_revocation_origin_are_variant_specific() {
+        assert!(
+            Error::Endpoint {
+                status: 429,
+                permanent: false,
+                error_code: None,
+                retry_after_ms: None,
+                body: String::new(),
+            }
+            .is_rate_limited()
+        );
+        assert!(!endpoint(400, Some("invalid_grant"), "").is_rate_limited());
+        assert!(!Error::Timeout("x".into()).is_rate_limited());
+        // revocation_origin is Some only for the revoked verdict.
+        assert_eq!(
+            Error::RefreshTokenRevoked {
+                origin: RevocationOrigin::DeadTokenClaim,
+            }
+            .revocation_origin(),
+            Some(&RevocationOrigin::DeadTokenClaim)
+        );
+        assert_eq!(
+            endpoint(400, Some("invalid_grant"), "").revocation_origin(),
+            None
+        );
+    }
+
+    #[test]
+    fn into_revocation_passes_through_a_verdict_and_rejects_unrelated_errors() {
+        // An already-revoked verdict is returned unchanged.
+        let revoked = Error::RefreshTokenRevoked {
+            origin: RevocationOrigin::LocalDeadSet,
+        }
+        .into_revocation()
+        .expect("a revoked verdict converts to itself");
+        assert!(matches!(
+            revoked,
+            Error::RefreshTokenRevoked {
+                origin: RevocationOrigin::LocalDeadSet
+            }
+        ));
+        // An unrelated error is handed back via Err, not reclassified as revoked.
+        let other = Error::Timeout("refresh".into())
+            .into_revocation()
+            .expect_err("a timeout is not a revocation");
+        assert!(matches!(other, Error::Timeout(_)));
+    }
 }

@@ -1659,4 +1659,852 @@ mod tests {
         let observation = snapshot.to_observation();
         assert_eq!(observation.five_hour_percent, Some(78.0));
     }
+
+    fn win(used: f64, checked_at: i64) -> QuotaWindow {
+        QuotaWindow {
+            used_percent: used,
+            remaining_percent: 100.0 - used,
+            resets_at: None,
+            checked_at,
+        }
+    }
+
+    fn scoped_win(id: &str, checked_at: i64, used: f64) -> ScopedQuotaWindow {
+        ScopedQuotaWindow {
+            id: id.to_owned(),
+            title: format!("{id} only"),
+            model_id: None,
+            model_name: id.to_owned(),
+            used_percent: used,
+            remaining_percent: 100.0 - used,
+            resets_at: None,
+            checked_at,
+        }
+    }
+
+    #[test]
+    fn window_name_wire_spellings_and_evaluation_order() {
+        assert_eq!(QuotaWindowName::FiveHour.as_str(), "five_hour");
+        assert_eq!(QuotaWindowName::SevenDay.as_str(), "seven_day");
+        assert_eq!(
+            QuotaWindowName::ALL,
+            [QuotaWindowName::FiveHour, QuotaWindowName::SevenDay]
+        );
+    }
+
+    #[test]
+    fn field_sources_get_set_and_is_empty() {
+        let mut fs = QuotaFieldSources::default();
+        assert!(fs.is_empty());
+        for field in QuotaField::ALL {
+            assert_eq!(fs.get(field), None);
+        }
+        fs.set(QuotaField::Scoped, Some(QuotaFieldSource::Poll));
+        assert_eq!(fs.get(QuotaField::Scoped), Some(QuotaFieldSource::Poll));
+        assert!(!fs.is_empty());
+        fs.set(QuotaField::ExtraUsage, Some(QuotaFieldSource::Headers));
+        assert_eq!(
+            fs.get(QuotaField::ExtraUsage),
+            Some(QuotaFieldSource::Headers)
+        );
+        fs.set(QuotaField::Scoped, None);
+        assert_eq!(fs.get(QuotaField::Scoped), None);
+        // Every slot round-trips through set/get.
+        for field in QuotaField::ALL {
+            fs.set(field, Some(QuotaFieldSource::Headers));
+            assert_eq!(fs.get(field), Some(QuotaFieldSource::Headers));
+        }
+        assert!(!fs.is_empty());
+    }
+
+    #[test]
+    fn money_formats_with_minor_unit_exponent() {
+        assert_eq!(
+            QuotaMoney {
+                amount_minor: 1234.0,
+                currency: "USD".to_owned(),
+                exponent: 2,
+            }
+            .format(),
+            "12.34 USD"
+        );
+        // A zero-exponent currency renders with no decimal places.
+        assert_eq!(
+            QuotaMoney {
+                amount_minor: 500.0,
+                currency: "JPY".to_owned(),
+                exponent: 0,
+            }
+            .format(),
+            "500 JPY"
+        );
+        // A three-exponent currency keeps all three.
+        assert_eq!(
+            QuotaMoney {
+                amount_minor: 1500.0,
+                currency: "BHD".to_owned(),
+                exponent: 3,
+            }
+            .format(),
+            "1.500 BHD"
+        );
+    }
+
+    #[test]
+    fn snapshot_has_field_and_standard_windows() {
+        let snap = polled();
+        assert!(snap.has_field(QuotaField::FiveHour));
+        assert!(snap.has_field(QuotaField::SevenDay));
+        assert!(snap.has_field(QuotaField::Scoped));
+        assert!(snap.has_field(QuotaField::BindingWindow));
+        assert!(!snap.has_field(QuotaField::ExtraUsage));
+        assert!(!snap.has_field(QuotaField::FallbackAdvised));
+        assert!(snap.has_standard_windows());
+
+        let only_five = QuotaSnapshot {
+            five_hour: snap.five_hour.clone(),
+            ..Default::default()
+        };
+        assert!(!only_five.has_standard_windows());
+        assert!(!QuotaSnapshot::default().has_standard_windows());
+    }
+
+    #[test]
+    fn field_source_falls_back_to_top_level_source() {
+        let snap = QuotaSnapshot {
+            five_hour: Some(win(10.0, NOW)),
+            source: Some(QuotaFieldSource::Headers),
+            field_sources: None,
+            ..Default::default()
+        };
+        // Present field, no per-field provenance: the top-level source answers.
+        assert_eq!(
+            snap.field_source(QuotaField::FiveHour),
+            Some(QuotaFieldSource::Headers)
+        );
+        // Absent field is None even though a top-level source exists.
+        assert_eq!(snap.field_source(QuotaField::ExtraUsage), None);
+        // A recorded per-field source outranks the top-level one.
+        let mut fs = QuotaFieldSources::default();
+        fs.set(QuotaField::FiveHour, Some(QuotaFieldSource::Poll));
+        let snap2 = QuotaSnapshot {
+            field_sources: Some(fs),
+            ..snap.clone()
+        };
+        assert_eq!(
+            snap2.field_source(QuotaField::FiveHour),
+            Some(QuotaFieldSource::Poll)
+        );
+    }
+
+    #[test]
+    fn checked_at_max_picks_newest_observation() {
+        let snap = QuotaSnapshot {
+            five_hour: Some(win(10.0, NOW)),
+            seven_day: Some(win(20.0, NOW + 1_000)),
+            scoped: Some(vec![scoped_win("a", NOW + 5_000, 5.0)]),
+            checked_at: Some(NOW + 2_000),
+            ..Default::default()
+        };
+        assert_eq!(snap.checked_at_max(), NOW + 5_000);
+        assert_eq!(QuotaSnapshot::default().checked_at_max(), 0);
+    }
+
+    #[test]
+    fn observation_carries_percentages_and_newest_stamp() {
+        let obs = polled().to_observation();
+        assert_eq!(obs.five_hour_percent, Some(4.0));
+        assert_eq!(obs.seven_day_percent, Some(13.0));
+        assert_eq!(obs.checked_at, chrono::DateTime::from_timestamp_millis(NOW));
+
+        let empty = QuotaSnapshot::default().to_observation();
+        assert!(empty.five_hour_percent.is_none());
+        assert!(empty.checked_at.is_none());
+    }
+
+    #[test]
+    fn clamp_percent_bounds_and_zeroes_non_finite() {
+        assert_eq!(clamp_percent(50.0), 50.0);
+        assert_eq!(clamp_percent(150.0), 100.0);
+        assert_eq!(clamp_percent(-5.0), 0.0);
+        assert_eq!(clamp_percent(f64::NAN), 0.0);
+        assert_eq!(clamp_percent(f64::INFINITY), 0.0);
+        assert_eq!(clamp_percent(f64::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn string_and_number_json_helpers() {
+        assert_eq!(
+            non_empty_str(Some(&serde_json::json!("  hi  "))),
+            Some("hi".to_owned())
+        );
+        assert_eq!(non_empty_str(Some(&serde_json::json!("   "))), None);
+        assert_eq!(non_empty_str(Some(&serde_json::json!(7))), None);
+        assert_eq!(non_empty_str(None), None);
+
+        assert_eq!(finite_number(Some(&serde_json::json!(3.5))), Some(3.5));
+        assert_eq!(finite_number(Some(&serde_json::json!(10))), Some(10.0));
+        assert_eq!(finite_number(Some(&serde_json::json!("x"))), None);
+        assert_eq!(finite_number(None), None);
+    }
+
+    #[test]
+    fn slug_and_model_key_normalization() {
+        assert_eq!(slug_for_quota_identity("Claude Fable 5"), "claude-fable-5");
+        // Leading/trailing junk never yields a dangling dash.
+        assert_eq!(slug_for_quota_identity("  --Fable!!Pro  "), "fable-pro");
+        assert_eq!(slug_for_quota_identity("!!!"), "");
+
+        assert_eq!(
+            normalize_scoped_quota_model("Claude-Fable-5"),
+            "claudefable5"
+        );
+        assert_eq!(
+            scoped_quota_model_key("anthropic/claude-fable-5").as_deref(),
+            Some("fable")
+        );
+        assert_eq!(
+            scoped_quota_model_key("Mythos Prime").as_deref(),
+            Some("mythos")
+        );
+        assert_eq!(
+            scoped_quota_model_key("claude-opus-4-8").as_deref(),
+            Some("claudeopus48")
+        );
+    }
+
+    #[test]
+    fn scoped_weekly_limits_dedupe_and_skip_invalid() {
+        let usage = serde_json::json!({
+            "limits": [
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 10, "is_active": false,
+                  "resets_at": "2026-01-01T00:00:00Z",
+                  "scope": { "model": { "id": "claude-fable-5", "display_name": "Fable" } } },
+                // Duplicate id (same model) is dropped; the first percent wins.
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 99, "is_active": false,
+                  "scope": { "model": { "id": "claude-fable-5", "display_name": "Fable" } } },
+                // Missing percent is skipped before the id is recorded.
+                { "kind": "weekly_scoped", "group": "weekly", "is_active": false,
+                  "scope": { "model": { "id": "claude-mythos", "display_name": "Mythos" } } },
+                // Empty display name yields no identity and is skipped.
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 5, "is_active": false,
+                  "scope": { "model": { "id": null, "display_name": "  " } } },
+                // Not a weekly-scoped limit at all.
+                { "kind": "session", "group": "session", "percent": 50, "is_active": false }
+            ]
+        });
+        let scoped = QuotaSnapshot::from_usage_response(&usage, NOW)
+            .scoped
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].id, "claude-weekly-scoped-claude-fable-5");
+        assert_eq!(scoped[0].model_id.as_deref(), Some("claude-fable-5"));
+        assert_eq!(scoped[0].model_name, "Fable");
+        assert_eq!(scoped[0].title, "Fable only");
+        assert_eq!(scoped[0].used_percent, 10.0);
+        assert_eq!(scoped[0].remaining_percent, 90.0);
+        assert_eq!(scoped[0].resets_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(scoped[0].checked_at, NOW);
+    }
+
+    #[test]
+    fn extra_usage_defaults_and_reads_spend_metadata() {
+        // Spend is null: currency and exponent default to USD / 2.
+        let defaulted = serde_json::json!({
+            "extra_usage": { "is_enabled": true, "used_credits": 50, "monthly_limit": 100, "utilization": 50 },
+            "spend": null
+        });
+        let e = QuotaSnapshot::from_usage_response(&defaulted, NOW)
+            .extra_usage
+            .unwrap();
+        assert_eq!(e.used.currency, "USD");
+        assert_eq!(e.used.exponent, 2);
+        assert_eq!(e.used.amount_minor, 50.0);
+        assert_eq!(e.limit.amount_minor, 100.0);
+        assert_eq!(e.utilization_percent, Some(50.0));
+        assert!(e.severity.is_none());
+        assert!(!e.exhausted);
+
+        // Spend metadata drives currency/exponent/severity; used >= limit exhausts.
+        let detailed = serde_json::json!({
+            "extra_usage": { "is_enabled": true, "used_credits": 200, "monthly_limit": 100 },
+            "spend": { "severity": "warning", "limit": { "currency": "EUR", "exponent": 3 } }
+        });
+        let e = QuotaSnapshot::from_usage_response(&detailed, NOW)
+            .extra_usage
+            .unwrap();
+        assert_eq!(e.used.currency, "EUR");
+        assert_eq!(e.used.exponent, 3);
+        assert_eq!(e.severity.as_deref(), Some("warning"));
+        assert!(e.exhausted);
+    }
+
+    #[test]
+    fn extra_usage_rejected_for_invalid_credits_or_metadata() {
+        let reject = |usage: serde_json::Value| {
+            QuotaSnapshot::from_usage_response(&usage, NOW)
+                .extra_usage
+                .is_none()
+        };
+        // Missing used_credits.
+        assert!(reject(serde_json::json!({
+            "extra_usage": { "is_enabled": true, "monthly_limit": 100 }
+        })));
+        // Missing monthly_limit.
+        assert!(reject(serde_json::json!({
+            "extra_usage": { "is_enabled": true, "used_credits": 50 }
+        })));
+        // Fractional exponent.
+        assert!(reject(serde_json::json!({
+            "extra_usage": { "is_enabled": true, "used_credits": 1, "monthly_limit": 2 },
+            "spend": { "limit": { "currency": "USD", "exponent": 2.5 } }
+        })));
+        // Currency that is not three alphabetic characters.
+        assert!(reject(serde_json::json!({
+            "extra_usage": { "is_enabled": true, "used_credits": 1, "monthly_limit": 2 },
+            "spend": { "limit": { "currency": "US", "exponent": 2 } }
+        })));
+    }
+
+    #[test]
+    fn binding_window_maps_each_active_kind() {
+        let binding = |usage: serde_json::Value| {
+            QuotaSnapshot::from_usage_response(&usage, NOW).binding_window
+        };
+        assert_eq!(
+            binding(serde_json::json!({ "limits": [{ "kind": "session", "is_active": true }] }))
+                .as_deref(),
+            Some("five_hour")
+        );
+        assert_eq!(
+            binding(serde_json::json!({ "limits": [{ "kind": "weekly_all", "is_active": true }] }))
+                .as_deref(),
+            Some("seven_day")
+        );
+        // No active limit yields no binding window and no binding source.
+        let idle = QuotaSnapshot::from_usage_response(
+            &serde_json::json!({ "limits": [{ "kind": "session", "is_active": false }] }),
+            NOW,
+        );
+        assert!(idle.binding_window.is_none());
+        assert!(idle.binding_window_source.is_none());
+        // An active limit of an unknown kind is not a binding window.
+        assert!(
+            binding(serde_json::json!({ "limits": [{ "kind": "mystery", "is_active": true }] }))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn finite_header_number_rejects_empty_and_unparseable() {
+        assert_eq!(finite_header_number(&[("h", "3.5")], "h"), Some(3.5));
+        assert_eq!(finite_header_number(&[("h", "  2.0 ")], "h"), Some(2.0));
+        // Empty and whitespace-only values are treated as absent.
+        assert_eq!(finite_header_number(&[("h", "")], "h"), None);
+        assert_eq!(finite_header_number(&[("h", "   ")], "h"), None);
+        assert_eq!(finite_header_number(&[("h", "nope")], "h"), None);
+        assert_eq!(finite_header_number(&[("other", "1")], "h"), None);
+    }
+
+    #[test]
+    fn js_round_is_half_up() {
+        assert_eq!(js_round(0.5), 1.0);
+        assert_eq!(js_round(1.5), 2.0);
+        assert_eq!(js_round(2.4), 2.0);
+        assert_eq!(js_round(2.6), 3.0);
+        // Halves round toward +inf, so -0.5 lands on 0, not -1.
+        assert_eq!(js_round(-0.5), 0.0);
+        assert_eq!(js_round(-1.5), -1.0);
+    }
+
+    #[test]
+    fn iso_timestamps_respect_js_date_range() {
+        assert_eq!(
+            iso_from_epoch_seconds(0.0).as_deref(),
+            Some("1970-01-01T00:00:00.000Z")
+        );
+        // Beyond JavaScript's Date range the reset is dropped rather than wrapped.
+        assert!(iso_from_epoch_seconds(1e20).is_none());
+        assert!(iso_from_epoch_seconds(f64::INFINITY).is_none());
+    }
+
+    #[test]
+    fn extract_overage_state_user_scope_and_statuses() {
+        let active = extract_overage_state(&[
+            ("anthropic-ratelimit-unified-overage-status", "active"),
+            ("anthropic-ratelimit-unified-overage-scope", "user"),
+            ("anthropic-ratelimit-unified-overage-in-use", "true"),
+        ])
+        .unwrap();
+        assert_eq!(active.status, OverageStatus::Active);
+        assert_eq!(active.scope, OverageScope::User);
+        assert!(active.in_use);
+        assert!(active.disabled_reason.is_none());
+
+        let available =
+            extract_overage_state(&[("anthropic-ratelimit-unified-overage-status", "available")])
+                .unwrap();
+        assert_eq!(available.status, OverageStatus::Available);
+        assert_eq!(available.scope, OverageScope::Unknown);
+        assert!(!available.in_use);
+
+        // An empty status header is treated as no overage frame at all.
+        assert!(
+            extract_overage_state(&[("anthropic-ratelimit-unified-overage-status", "")]).is_none()
+        );
+    }
+
+    #[test]
+    fn extract_grace_state_reset_only_and_inactive_zero() {
+        // Reset present, utilisation absent: inactive but still carries a reset.
+        let reset_only =
+            extract_grace_state(&[("anthropic-ratelimit-unified-grace-reset", "0")]).unwrap();
+        assert!(!reset_only.active);
+        assert!(reset_only.utilization.is_none());
+        assert_eq!(
+            reset_only.resets_at.as_deref(),
+            Some("1970-01-01T00:00:00.000Z")
+        );
+
+        // Zero utilisation is not active.
+        let zero =
+            extract_grace_state(&[("anthropic-ratelimit-unified-grace-utilization", "0")]).unwrap();
+        assert!(!zero.active);
+        assert_eq!(zero.utilization, Some(0.0));
+        assert!(zero.resets_at.is_none());
+
+        assert!(extract_grace_state(&[("unrelated", "x")]).is_none());
+    }
+
+    #[test]
+    fn merge_fallback_without_field_sources_uses_top_level_source() {
+        // Existing is a poll-sourced snapshot that advises fallback but has no
+        // per-field provenance recorded, so the merge must fall back to the
+        // top-level source to label the preserved fallback advisory.
+        let existing = QuotaSnapshot {
+            five_hour: Some(win(10.0, NOW)),
+            fallback_advised: Some(true),
+            source: Some(QuotaFieldSource::Poll),
+            field_sources: None,
+            ..Default::default()
+        };
+        let incoming = normalize_quota_headers(
+            &[("anthropic-ratelimit-unified-5h-utilization", "0.5")],
+            NOW + 1_000,
+        );
+        let merged = merge_header_quota_snapshot(Some(&existing), &incoming);
+        assert_eq!(merged.fallback_advised, Some(true));
+        assert_eq!(
+            merged.field_sources.unwrap().fallback_advised,
+            Some(QuotaFieldSource::Poll)
+        );
+    }
+
+    #[test]
+    fn source_precedence_orders_poll_over_headers() {
+        assert_eq!(source_precedence(&QuotaSnapshot::default()), 0);
+        assert_eq!(
+            source_precedence(&QuotaSnapshot {
+                source: Some(QuotaFieldSource::Headers),
+                ..Default::default()
+            }),
+            1
+        );
+        assert_eq!(
+            source_precedence(&QuotaSnapshot {
+                source: Some(QuotaFieldSource::Poll),
+                ..Default::default()
+            }),
+            2
+        );
+    }
+
+    #[test]
+    fn merge_header_owned_window_keeps_newer_or_higher_precedence() {
+        let only_existing = QuotaSnapshot {
+            five_hour: Some(win(10.0, NOW)),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_header_owned_window(
+                &only_existing,
+                &QuotaSnapshot::default(),
+                QuotaWindowName::FiveHour
+            ),
+            only_existing.five_hour
+        );
+
+        let only_incoming = QuotaSnapshot {
+            five_hour: Some(win(20.0, NOW)),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_header_owned_window(
+                &QuotaSnapshot::default(),
+                &only_incoming,
+                QuotaWindowName::FiveHour
+            ),
+            only_incoming.five_hour
+        );
+
+        // Both present: the newer observation wins regardless of order.
+        let older = QuotaSnapshot {
+            five_hour: Some(win(10.0, NOW)),
+            ..Default::default()
+        };
+        let newer = QuotaSnapshot {
+            five_hour: Some(win(20.0, NOW + 1_000)),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_header_owned_window(&older, &newer, QuotaWindowName::FiveHour)
+                .unwrap()
+                .used_percent,
+            20.0
+        );
+        assert_eq!(
+            merge_header_owned_window(&newer, &older, QuotaWindowName::FiveHour)
+                .unwrap()
+                .used_percent,
+            20.0
+        );
+
+        // Equal timestamps: the higher-precedence (poll) source is kept.
+        let poll = QuotaSnapshot {
+            five_hour: Some(win(10.0, NOW)),
+            source: Some(QuotaFieldSource::Poll),
+            ..Default::default()
+        };
+        let header = QuotaSnapshot {
+            five_hour: Some(win(20.0, NOW)),
+            source: Some(QuotaFieldSource::Headers),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_header_owned_window(&poll, &header, QuotaWindowName::FiveHour)
+                .unwrap()
+                .used_percent,
+            10.0
+        );
+        // Equal timestamps and equal precedence: incoming wins.
+        let header2 = QuotaSnapshot {
+            five_hour: Some(win(30.0, NOW)),
+            source: Some(QuotaFieldSource::Headers),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_header_owned_window(&header, &header2, QuotaWindowName::FiveHour)
+                .unwrap()
+                .used_percent,
+            30.0
+        );
+    }
+
+    #[test]
+    fn merge_header_scoped_unions_and_prefers_newer() {
+        // Existing has no scoped data: incoming is adopted.
+        let incoming = QuotaSnapshot {
+            scoped: Some(vec![scoped_win("a", NOW, 10.0)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_header_scoped(&QuotaSnapshot::default(), &incoming),
+            incoming.scoped
+        );
+
+        // A present-but-empty existing array survives untouched.
+        let empty_existing = QuotaSnapshot {
+            scoped: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_header_scoped(&empty_existing, &incoming),
+            Some(Vec::new())
+        );
+
+        // Non-empty existing, empty/absent incoming: existing is kept.
+        let existing = QuotaSnapshot {
+            scoped: Some(vec![scoped_win("a", NOW, 10.0)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_header_scoped(&existing, &QuotaSnapshot::default()),
+            existing.scoped
+        );
+
+        // Union by id: the newer observation of a shared id wins, unique ids
+        // from both sides survive.
+        let inc = QuotaSnapshot {
+            scoped: Some(vec![scoped_win("a", NOW, 10.0), scoped_win("c", NOW, 30.0)]),
+            ..Default::default()
+        };
+        let ex = QuotaSnapshot {
+            scoped: Some(vec![
+                scoped_win("a", NOW + 1_000, 15.0),
+                scoped_win("b", NOW, 20.0),
+            ]),
+            ..Default::default()
+        };
+        let merged = merge_header_scoped(&ex, &inc).unwrap();
+        assert_eq!(merged.len(), 3);
+        assert_eq!(
+            merged.iter().find(|w| w.id == "a").unwrap().used_percent,
+            15.0
+        );
+        assert!(merged.iter().any(|w| w.id == "b"));
+        assert!(merged.iter().any(|w| w.id == "c"));
+
+        // An older existing observation does not override a newer incoming one.
+        let inc_newer = QuotaSnapshot {
+            scoped: Some(vec![scoped_win("a", NOW + 5_000, 99.0)]),
+            ..Default::default()
+        };
+        let ex_older = QuotaSnapshot {
+            scoped: Some(vec![scoped_win("a", NOW, 10.0)]),
+            ..Default::default()
+        };
+        let merged = merge_header_scoped(&ex_older, &inc_newer).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].used_percent, 99.0);
+    }
+
+    #[test]
+    fn persistence_merge_short_circuits_on_missing_base_or_poll_incoming() {
+        let incoming = normalize_quota_headers(&MAIN_HEADERS, NOW);
+        // No base: incoming is returned verbatim.
+        assert_eq!(
+            merge_header_quota_for_persistence(None, &incoming),
+            incoming
+        );
+        // Incoming is a poll (not header-sourced): it wins outright.
+        let poll = polled();
+        let existing = normalize_quota_headers(&TEAM_HEADERS, NOW + 5_000);
+        assert_eq!(
+            merge_header_quota_for_persistence(Some(&existing), &poll),
+            poll
+        );
+    }
+
+    #[test]
+    fn persistence_merge_preserves_poll_binding_and_scoped() {
+        let existing = polled(); // poll binding = scoped-fable, scoped Some
+        let incoming = normalize_quota_headers(&MAIN_HEADERS, NOW + 10_000);
+        let merged = merge_header_quota_for_persistence(Some(&existing), &incoming);
+        // Poll-owned binding window is preserved against the header claim.
+        assert_eq!(
+            merged.binding_window.as_deref(),
+            Some("claude-weekly-scoped-fable")
+        );
+        assert_eq!(merged.binding_window_source, Some(QuotaFieldSource::Poll));
+        // Poll-owned scoped data is preserved.
+        assert_eq!(merged.scoped, existing.scoped);
+        // The newer header window is adopted.
+        assert_eq!(merged.five_hour.as_ref().unwrap().used_percent, 3.0);
+        let srcs = merged.field_sources.unwrap();
+        assert_eq!(srcs.scoped, Some(QuotaFieldSource::Poll));
+        assert_eq!(srcs.binding_window, Some(QuotaFieldSource::Poll));
+        assert_eq!(srcs.five_hour, Some(QuotaFieldSource::Headers));
+    }
+
+    #[test]
+    fn policy_fails_closed_on_non_finite_remaining() {
+        let snap = QuotaSnapshot {
+            five_hour: Some(QuotaWindow {
+                used_percent: 0.0,
+                remaining_percent: f64::NAN,
+                resets_at: None,
+                checked_at: NOW,
+            }),
+            seven_day: Some(win(0.0, NOW)),
+            ..Default::default()
+        };
+        assert!(!QuotaPolicy::default().passes(Some(&snap)));
+        let lenient = QuotaPolicy {
+            fail_closed_on_unknown: false,
+            ..QuotaPolicy::default()
+        };
+        assert!(lenient.passes(Some(&snap)));
+    }
+
+    #[test]
+    fn policy_floors_interval_and_reads_per_window_minimums() {
+        let p = QuotaPolicy {
+            check_interval_ms: 1_000,
+            minimum_remaining_five_hour: 5.0,
+            minimum_remaining_seven_day: 9.0,
+            ..QuotaPolicy::default()
+        };
+        assert_eq!(p.interval_ms(), 60_000);
+        assert_eq!(p.minimum_remaining(QuotaWindowName::FiveHour), 5.0);
+        assert_eq!(p.minimum_remaining(QuotaWindowName::SevenDay), 9.0);
+        let wide = QuotaPolicy {
+            check_interval_ms: 600_000,
+            ..QuotaPolicy::default()
+        };
+        assert_eq!(wide.interval_ms(), 600_000);
+    }
+
+    #[test]
+    fn snapshot_is_fresh_requires_both_windows_within_interval() {
+        let policy = QuotaPolicy::default();
+        let snap = polled();
+        assert!(policy.snapshot_is_fresh(Some(&snap), NOW));
+        assert!(policy.snapshot_is_fresh(Some(&snap), NOW + DEFAULT_QUOTA_CHECK_INTERVAL_MS - 1));
+        // The horizon is strict: exactly one interval old is no longer fresh.
+        assert!(!policy.snapshot_is_fresh(Some(&snap), NOW + DEFAULT_QUOTA_CHECK_INTERVAL_MS));
+        // A missing window is never fresh.
+        let only_five = QuotaSnapshot {
+            five_hour: snap.five_hour.clone(),
+            ..Default::default()
+        };
+        assert!(!policy.snapshot_is_fresh(Some(&only_five), NOW));
+        assert!(!policy.snapshot_is_fresh(None, NOW));
+        // Disabled policy reports fresh unconditionally.
+        let disabled = QuotaPolicy {
+            enabled: false,
+            ..QuotaPolicy::default()
+        };
+        assert!(disabled.snapshot_is_fresh(None, NOW));
+    }
+
+    #[test]
+    fn is_stale_when_standard_or_scoped_window_ages_out() {
+        let policy = QuotaPolicy::default();
+        let snap = polled();
+        assert!(!policy.is_stale(Some(&snap), NOW, Some("Fable")));
+        // A standard window past the interval is stale.
+        assert!(policy.is_stale(
+            Some(&snap),
+            NOW + DEFAULT_QUOTA_CHECK_INTERVAL_MS,
+            Some("Fable")
+        ));
+
+        // Standard windows refreshed but the scoped window left behind.
+        let fresh_now = NOW + DEFAULT_QUOTA_CHECK_INTERVAL_MS + 1;
+        let mut mixed = snap.clone();
+        mixed.five_hour.as_mut().unwrap().checked_at = fresh_now;
+        mixed.seven_day.as_mut().unwrap().checked_at = fresh_now;
+        assert!(policy.is_stale(Some(&mixed), fresh_now, Some("Fable")));
+        // Without a model scope only the standard windows are considered.
+        assert!(!policy.is_stale(Some(&mixed), fresh_now, None));
+    }
+
+    #[test]
+    fn next_refresh_handles_disabled_missing_and_unresettable_blocks() {
+        let disabled = QuotaPolicy {
+            enabled: false,
+            ..QuotaPolicy::default()
+        };
+        assert_eq!(
+            disabled.next_refresh_at(Some(&polled()), NOW),
+            NOW + DEFAULT_QUOTA_CHECK_INTERVAL_MS
+        );
+
+        let policy = QuotaPolicy::default();
+        // No windows at all: one interval out, uncapped.
+        assert_eq!(
+            policy.next_refresh_at(Some(&QuotaSnapshot::default()), NOW),
+            NOW + DEFAULT_QUOTA_CHECK_INTERVAL_MS
+        );
+        assert_eq!(
+            policy.next_refresh_at(None, NOW),
+            NOW + DEFAULT_QUOTA_CHECK_INTERVAL_MS
+        );
+
+        // A blocking window with no parseable reset falls back to one interval,
+        // capped at the oldest window's freshness deadline.
+        let strict = QuotaPolicy {
+            minimum_remaining_five_hour: 99.0,
+            ..QuotaPolicy::default()
+        };
+        let mut blocked = polled();
+        blocked.five_hour.as_mut().unwrap().resets_at = None;
+        assert_eq!(
+            strict.next_refresh_at(Some(&blocked), NOW),
+            NOW + DEFAULT_QUOTA_CHECK_INTERVAL_MS
+        );
+    }
+
+    #[test]
+    fn poll_completion_returns_poll_when_current_absent_or_poll() {
+        let poll = polled();
+        assert_eq!(merge_poll_completion_with_newer_headers(None, &poll), poll);
+        // A poll-sourced current is not a header cache, so the poll wins.
+        let other_poll = QuotaSnapshot::from_usage_response(&team_usage_capture(), NOW + 100_000);
+        assert_eq!(
+            merge_poll_completion_with_newer_headers(Some(&other_poll), &poll),
+            poll
+        );
+
+        // Only the newer header window is kept; the poll's other data survives.
+        let header = normalize_quota_headers(
+            &[("anthropic-ratelimit-unified-5h-utilization", "0.9")],
+            NOW + 60_000,
+        );
+        let merged = merge_poll_completion_with_newer_headers(Some(&header), &poll);
+        assert_eq!(merged.five_hour.as_ref().unwrap().used_percent, 90.0);
+        assert_eq!(merged.seven_day, poll.seven_day);
+        assert_eq!(merged.scoped, poll.scoped);
+    }
+
+    #[test]
+    fn parse_iso_ms_round_trips_and_rejects_garbage() {
+        assert_eq!(
+            parse_iso_ms("2026-01-01T00:00:00Z"),
+            Some(1_767_225_600_000)
+        );
+        assert_eq!(
+            parse_iso_ms("2026-01-01T00:00:00.500Z"),
+            Some(1_767_225_600_500)
+        );
+        assert!(parse_iso_ms("not-a-date").is_none());
+        assert!(parse_iso_ms("").is_none());
+    }
+
+    #[test]
+    fn cached_windows_relevant_until_reset_passes() {
+        assert!(!cached_window_still_relevant(None, NOW));
+
+        let base = win(0.0, NOW);
+        // No reset: always relevant.
+        assert!(cached_window_still_relevant(Some(&base), NOW));
+        // Unparseable reset: treated as still relevant.
+        let garbage = QuotaWindow {
+            resets_at: Some("garbage".to_owned()),
+            ..base.clone()
+        };
+        assert!(cached_window_still_relevant(Some(&garbage), NOW));
+        // Future reset: relevant; past reset: no longer relevant.
+        let future = chrono::DateTime::from_timestamp_millis(NOW + 60_000)
+            .unwrap()
+            .to_rfc3339();
+        let past = chrono::DateTime::from_timestamp_millis(NOW - 60_000)
+            .unwrap()
+            .to_rfc3339();
+        let relevant = QuotaWindow {
+            resets_at: Some(future),
+            ..base.clone()
+        };
+        let expired = QuotaWindow {
+            resets_at: Some(past),
+            ..base.clone()
+        };
+        assert!(cached_window_still_relevant(Some(&relevant), NOW));
+        assert!(!cached_window_still_relevant(Some(&expired), NOW));
+
+        // The snapshot form requires both standard windows to be relevant.
+        let fresh = QuotaSnapshot {
+            five_hour: Some(relevant.clone()),
+            seven_day: Some(base.clone()),
+            ..Default::default()
+        };
+        assert!(cached_snapshot_still_relevant(Some(&fresh), NOW));
+        let stale = QuotaSnapshot {
+            five_hour: Some(relevant),
+            seven_day: Some(expired),
+            ..Default::default()
+        };
+        assert!(!cached_snapshot_still_relevant(Some(&stale), NOW));
+        assert!(!cached_snapshot_still_relevant(None, NOW));
+    }
 }

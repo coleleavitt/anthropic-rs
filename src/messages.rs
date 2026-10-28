@@ -597,4 +597,393 @@ mod tests {
         // Draining twice yields nothing.
         assert!(d.finish().is_none());
     }
+
+    #[test]
+    fn sse_decoder_picks_the_earliest_frame_boundary_when_both_styles_present_robust() {
+        let mut d = SseDecoder::new();
+        // The first frame closes with LF-LF, the second with CRLF-CRLF. The
+        // decoder must cut at whichever boundary comes first in the buffer, not
+        // whichever style it looks for first.
+        let events = d.push("event: a\ndata: 1\n\nevent: b\r\ndata: 2\r\n\r\n");
+        assert_eq!(
+            events,
+            vec![
+                SseEvent {
+                    event: "a".into(),
+                    data: "1".into(),
+                },
+                SseEvent {
+                    event: "b".into(),
+                    data: "2".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sse_decoder_cuts_at_a_crlf_boundary_before_a_later_lf_boundary_robust() {
+        let mut d = SseDecoder::new();
+        // Mirror image: a CRLF-CRLF separator precedes a later LF-LF one, so the
+        // CRLF offset must win the comparison.
+        let events = d.push("data: first\r\n\r\ndata: second\n\n");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].data, "first");
+        assert_eq!(events[1].data, "second");
+    }
+
+    #[test]
+    fn sse_decoder_ignores_unknown_fields_and_bare_lines_robust() {
+        let mut d = SseDecoder::new();
+        // `id:` and `retry:` are SSE fields this client does not consume, and a
+        // line with no colon is a bare field name carrying an empty value. None
+        // of the three may surface, but a real `data:` in the same frame still
+        // produces an event whose `event` name stayed empty.
+        let events = d.push("id: 99\nretry: 3000\nbarefield\ndata: payload\n\n");
+        assert_eq!(
+            events,
+            vec![SseEvent {
+                event: String::new(),
+                data: "payload".into(),
+            }]
+        );
+    }
+
+    #[cfg(feature = "client")]
+    const TEST_API_KEY: &str = "sk-ant-api01-abcdefghijklmnopqrstuvwxyz012345";
+
+    #[cfg(feature = "client")]
+    fn endpoints_at(base: &str) -> Endpoints {
+        let mut endpoints = Endpoints::prod();
+        endpoints.base_api_url = base.to_owned();
+        endpoints
+    }
+
+    #[cfg(feature = "client")]
+    fn api_key_credential() -> Credential {
+        Credential::ApiKey {
+            key: ApiKey::new(TEST_API_KEY),
+        }
+    }
+
+    /// A live (non-expired, inference-scoped) OAuth session, so
+    /// `validate_for_request` lets the request through to the mock endpoint.
+    #[cfg(feature = "client")]
+    fn live_oauth_credential() -> Credential {
+        Credential::Oauth(OAuthTokens {
+            access: AccessToken::new("sk-ant-oat01-liveaccessliveaccessliveacc"),
+            refresh: RefreshToken::new("sk-ant-ort01-liverefreshliverefreshlive"),
+            expires_at: Utc.timestamp_opt(1_900_000_000, 0).unwrap(),
+            refresh_expires_at: Some(Utc.timestamp_opt(2_000_000_000, 0).unwrap()),
+            scopes: vec!["user:inference".into()],
+            account: None,
+            organization: None,
+        })
+    }
+
+    /// A loopback HTTP server that answers every request with the same
+    /// `status`/`body` and records each raw request (head and body) it read.
+    #[cfg(feature = "client")]
+    async fn mock_messages_server(
+        status: u16,
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = captured.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let Ok(read) = stream.read(&mut chunk).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&chunk[..read]);
+                        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers =
+                                String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                            let length = headers
+                                .lines()
+                                .find_map(|l| {
+                                    l.strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    sink.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&request).into_owned());
+                    let reason = if (200..300).contains(&status) {
+                        "OK"
+                    } else {
+                        "Error"
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{address}"), captured)
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn send_parses_a_successful_response_and_sends_the_request_body_normal() {
+        const BODY: &str = r#"{
+            "id": "msg_42",
+            "model": "claude-opus-4",
+            "content": [{"type":"text","text":"pong"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 11, "output_tokens": 3}
+        }"#;
+        let (base, requests) = mock_messages_server(200, BODY).await;
+        let client = MessagesClient::new(endpoints_at(&base));
+        let request = MessagesRequest::new("claude-opus-4", 64, vec![Message::user("ping")]);
+
+        let response = client.send(&api_key_credential(), &request).await.unwrap();
+
+        assert_eq!(response.id, "msg_42");
+        assert_eq!(response.model, "claude-opus-4");
+        assert_eq!(response.text(), "pong");
+        assert_eq!(response.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(response.usage.input_tokens, 11);
+        assert_eq!(response.usage.output_tokens, 3);
+
+        let raw = requests.lock().unwrap();
+        assert_eq!(raw.len(), 1);
+        let sent = &raw[0];
+        assert!(
+            sent.starts_with("POST /v1/messages "),
+            "request line: {sent}"
+        );
+        assert!(sent.contains(&format!("x-api-key: {TEST_API_KEY}")));
+        assert!(sent.contains("content-type: application/json"));
+        assert!(sent.contains("anthropic-version: 2023-06-01"));
+        // A non-streaming request leaves `stream` off the wire entirely.
+        assert!(sent.contains(r#""model":"claude-opus-4""#));
+        assert!(!sent.contains(r#""stream":true"#));
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn send_maps_a_client_error_status_to_a_permanent_endpoint_error_and_redacts_the_key() {
+        // The server echoes the caller's API key back in the body; it must never
+        // survive into the error the caller can log.
+        let body: &'static str = concat!(
+            r#"{"error":{"type":"invalid_request_error","message":"bad"},"#,
+            r#""leaked":"sk-ant-api01-abcdefghijklmnopqrstuvwxyz012345"}"#
+        );
+        let (base, _requests) = mock_messages_server(400, body).await;
+        let client = MessagesClient::new(endpoints_at(&base));
+        let request = MessagesRequest::new("claude-x", 16, vec![Message::user("hi")]);
+
+        let error = client
+            .send(&api_key_credential(), &request)
+            .await
+            .unwrap_err();
+
+        match error {
+            Error::Endpoint {
+                status,
+                permanent,
+                error_code,
+                body,
+                ..
+            } => {
+                assert_eq!(status, 400);
+                assert!(permanent, "400 is not retryable");
+                assert_eq!(error_code.as_deref(), Some("invalid_request_error"));
+                assert!(
+                    !body.contains(TEST_API_KEY),
+                    "the raw key leaked into the error body: {body}"
+                );
+                assert!(body.contains("sk-ant-***REDACTED***"));
+            }
+            other => panic!("expected an endpoint error, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn stream_flips_the_stream_flag_and_returns_a_decodable_body_normal() {
+        const STREAM_BODY: &str = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\"}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"delta\":\"hi\"}\n\n",
+        );
+        let (base, requests) = mock_messages_server(200, STREAM_BODY).await;
+        // Exercise the caller-provided-client constructor on this path.
+        let client = MessagesClient::with_http(reqwest::Client::new(), endpoints_at(&base));
+        // Built non-streaming on purpose: `stream` must set the flag itself.
+        let request = MessagesRequest::new("claude-x", 32, vec![Message::user("hi")]);
+
+        let response = client
+            .stream(&api_key_credential(), &request)
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let text = response.text().await.unwrap();
+
+        let mut decoder = SseDecoder::new();
+        let events = decoder.push(&text);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event, "message_start");
+        assert_eq!(events[1].event, "content_block_delta");
+        assert_eq!(events[1].data, r#"{"delta":"hi"}"#);
+
+        let raw = requests.lock().unwrap();
+        assert!(
+            raw[0].contains(r#""stream":true"#),
+            "stream() must enable streaming on the wire: {}",
+            raw[0]
+        );
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn stream_maps_an_oauth_401_to_a_transient_endpoint_error() {
+        let (base, _requests) =
+            mock_messages_server(401, r#"{"error":{"type":"authentication_error"}}"#).await;
+        let client = MessagesClient::new(endpoints_at(&base));
+        let request = MessagesRequest::new("claude-x", 32, vec![Message::user("hi")]);
+
+        let error = client
+            .stream(&live_oauth_credential(), &request)
+            .await
+            .unwrap_err();
+
+        match error {
+            Error::Endpoint {
+                status,
+                permanent,
+                error_code,
+                ..
+            } => {
+                assert_eq!(status, 401);
+                // An OAuth 401 is recoverable by refreshing the token.
+                assert!(!permanent);
+                assert_eq!(error_code.as_deref(), Some("authentication_error"));
+            }
+            other => panic!("expected an endpoint error, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "client")]
+    #[tokio::test]
+    async fn send_refuses_an_expired_oauth_credential_before_any_request_is_sent() {
+        // A session past its refresh-token lifetime must be rejected locally;
+        // the mock endpoint must see zero requests.
+        let (base, requests) = mock_messages_server(200, "{}").await;
+        let client = MessagesClient::new(endpoints_at(&base));
+        let credential = Credential::Oauth(OAuthTokens {
+            access: AccessToken::new("sk-ant-oat01-deadaccessdeadaccessdeadac"),
+            refresh: RefreshToken::new("sk-ant-ort01-deadrefreshdeadrefreshdea"),
+            expires_at: Utc.timestamp_opt(1_000_000_000, 0).unwrap(),
+            refresh_expires_at: Some(Utc.timestamp_opt(1_000_000_100, 0).unwrap()),
+            scopes: vec!["user:inference".into()],
+            account: None,
+            organization: None,
+        });
+        let request = MessagesRequest::new("claude-x", 16, vec![Message::user("hi")]);
+
+        let error = client.send(&credential, &request).await.unwrap_err();
+
+        assert!(matches!(error, Error::RefreshTokenExpired), "got {error:?}");
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "no request should reach the endpoint"
+        );
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn api_error_classifies_client_errors_as_permanent() {
+        let headers = reqwest::header::HeaderMap::new();
+        for status in [400u16, 403, 404, 422] {
+            let error = api_error(status, &headers, r#"{"error":"bad_request"}"#.into(), false);
+            match error {
+                Error::Endpoint {
+                    status: got,
+                    permanent,
+                    error_code,
+                    ..
+                } => {
+                    assert_eq!(got, status);
+                    assert!(permanent, "status {status} should be permanent");
+                    assert_eq!(error_code.as_deref(), Some("bad_request"));
+                }
+                other => panic!("expected an endpoint error, got {other:?}"),
+            }
+        }
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn api_error_classifies_server_and_throttle_errors_as_transient_with_retry_after() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "retry-after-ms",
+            reqwest::header::HeaderValue::from_static("2500"),
+        );
+        let throttled = api_error(
+            429,
+            &headers,
+            r#"{"error":{"type":"rate_limit_error"}}"#.into(),
+            false,
+        );
+        match throttled {
+            Error::Endpoint {
+                status,
+                permanent,
+                error_code,
+                retry_after_ms,
+                ..
+            } => {
+                assert_eq!(status, 429);
+                assert!(!permanent);
+                assert_eq!(error_code.as_deref(), Some("rate_limit_error"));
+                assert_eq!(retry_after_ms, Some(2500));
+            }
+            other => panic!("expected an endpoint error, got {other:?}"),
+        }
+
+        // 5xx statuses are transient and carry no retry hint here.
+        let empty = reqwest::header::HeaderMap::new();
+        for status in [500u16, 503] {
+            let error = api_error(status, &empty, "upstream".into(), false);
+            match error {
+                Error::Endpoint {
+                    permanent,
+                    retry_after_ms,
+                    ..
+                } => {
+                    assert!(!permanent, "status {status} should be transient");
+                    assert_eq!(retry_after_ms, None);
+                }
+                other => panic!("expected an endpoint error, got {other:?}"),
+            }
+        }
+    }
 }

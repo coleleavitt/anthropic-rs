@@ -837,6 +837,66 @@ mod tests {
     }
 
     #[test]
+    fn into_tokens_rejects_each_malformed_field() {
+        let base = || TokenResponse {
+            access_token: VALID_ACCESS.into(),
+            refresh_token: Some(VALID_REFRESH.into()),
+            expires_in: 3600,
+            refresh_token_expires_in: None,
+            scope: Some("user:inference".into()),
+            token_type: None,
+            account: None,
+            organization: None,
+        };
+        // A malformed access token is rejected outright.
+        assert!(matches!(
+            TokenResponse {
+                access_token: "not-a-token".into(),
+                ..base()
+            }
+            .into_tokens(now(), None),
+            Err(Error::MalformedTokenResponse("access_token"))
+        ));
+        // A present-but-malformed rotated refresh token is rejected even when a
+        // prior refresh token exists (the server sent garbage, don't fall back).
+        assert!(matches!(
+            TokenResponse {
+                refresh_token: Some("short".into()),
+                ..base()
+            }
+            .into_tokens(now(), Some(&prior_tokens())),
+            Err(Error::MalformedTokenResponse("refresh_token"))
+        ));
+        // A non-positive access-token lifetime is rejected.
+        assert!(matches!(
+            TokenResponse {
+                expires_in: 0,
+                ..base()
+            }
+            .into_tokens(now(), None),
+            Err(Error::MalformedTokenResponse("expires_in"))
+        ));
+        // A reported-but-non-positive refresh lifetime is rejected.
+        assert!(matches!(
+            TokenResponse {
+                refresh_token_expires_in: Some(-1),
+                ..base()
+            }
+            .into_tokens(now(), None),
+            Err(Error::MalformedTokenResponse("refresh_token_expires_in"))
+        ));
+        // A lifetime that would overflow the clock is rejected, not panicked on.
+        assert!(matches!(
+            TokenResponse {
+                expires_in: i64::MAX,
+                ..base()
+            }
+            .into_tokens(now(), None),
+            Err(Error::MalformedTokenResponse("expires_in"))
+        ));
+    }
+
+    #[test]
     fn into_tokens_rejects_scopes_without_inference() {
         let resp = TokenResponse {
             access_token: VALID_ACCESS.into(),

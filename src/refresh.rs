@@ -1243,6 +1243,91 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn unauthorized_recovery_refuses_when_the_store_cannot_be_read() {
+        // A path that is a directory, not a file: the store read fails, so the
+        // recovery cannot locate the row and declines without any token call.
+        const TAG: &str = "recover401-noread";
+        let path = store_path(TAG);
+        std::fs::create_dir_all(&path).unwrap();
+        let (url, hits) = token_server(200, ROTATED_BODY).await;
+        let recovery = client(&url)
+            .recover_unauthorized(
+                &path,
+                "sk-ant-oat01-old-recover401-noread-aaaaaaaaaaaaaaaaaaaaaa",
+                &SharedRefreshOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(!recovery.decision.retry);
+        assert_eq!(
+            recovery.decision.reason,
+            crate::retry::RetryAfter401Reason::ReauthorizeFailed
+        );
+        assert!(recovery.outcome.is_none());
+        assert!(recovery.failure.is_none());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no token call on a read miss"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_recovery_refuses_a_login_that_has_no_refresh_token() {
+        // The store holds the rejected access token but no refresh token to spend
+        // (a login that needs re-authorization): decline without a token call.
+        const TAG: &str = "recover401-norefresh";
+        let access = "sk-ant-oat01-old-recover401-norefresh-aaaaaaaaaaaaaaaa";
+        let path = store_path(TAG);
+        seeded_store(&path, &tokens("", access, at(-10)));
+        let (url, hits) = token_server(200, ROTATED_BODY).await;
+        let recovery = client(&url)
+            .recover_unauthorized(&path, access, &SharedRefreshOptions::default())
+            .await
+            .unwrap();
+        assert!(!recovery.decision.retry);
+        assert_eq!(
+            recovery.decision.reason,
+            crate::retry::RetryAfter401Reason::ReauthorizeFailed
+        );
+        assert!(recovery.outcome.is_none());
+        assert!(recovery.failure.is_none());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "no token call without a refresh token"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_recovery_does_not_retry_when_the_refresh_returns_the_same_token() {
+        // The server completes the refresh but hands back the already-rejected
+        // access token (no rotation): the decision must not retry, so the caller
+        // never loops on a dead credential, and no refreshed outcome is offered.
+        const TAG: &str = "recover401-same";
+        const SAME_ACCESS: &str = "sk-ant-oat01-old-recover401-same-aaaaaaaaaaaaaaaaaaaaaa";
+        const SAME_TOKEN_BODY: &str = r#"{"access_token":"sk-ant-oat01-old-recover401-same-aaaaaaaaaaaaaaaaaaaaaa","refresh_token":"sk-ant-ort01-rotated-recover401-same-aaaaaaaaaaaa","expires_in":3600,"scope":"user:inference"}"#;
+        let path = store_path(TAG);
+        let presented = tokens(
+            "sk-ant-ort01-old-recover401-same-aaaaaaaaaaaaaaaaaaaaaa",
+            SAME_ACCESS,
+            at(-10),
+        );
+        seeded_store(&path, &presented);
+        let (url, hits) = token_server(200, SAME_TOKEN_BODY).await;
+        let recovery = client(&url)
+            .recover_unauthorized(&path, SAME_ACCESS, &SharedRefreshOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the refresh did run");
+        assert!(!recovery.decision.retry);
+        assert!(
+            recovery.outcome.is_none(),
+            "a non-retry decision offers no outcome"
+        );
+    }
+
     #[test]
     fn shared_receipts_carry_only_fingerprints() {
         let tokens = old_tokens("receipt");

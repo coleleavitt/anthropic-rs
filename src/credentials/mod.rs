@@ -469,4 +469,284 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// A deterministic environment lookup over a fixed pair list, so the
+    /// resolution helpers can be driven without touching the real process
+    /// environment.
+    fn env_lookup(
+        pairs: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<String> {
+        move |key: &str| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    fn file_source() -> NativeClaudeCredentialSource {
+        NativeClaudeCredentialSource::CredentialsFile(PathBuf::from("/tmp/native.json"))
+    }
+
+    #[test]
+    fn credentials_path_prefers_securestorage_dir_then_config_then_home() {
+        // A non-empty CLAUDE_SECURESTORAGE_CONFIG_DIR wins over everything.
+        assert_eq!(
+            native_claude_credentials_path_from_lookup(env_lookup(&[
+                ("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/secure/dir"),
+                ("CLAUDE_CONFIG_DIR", "/cfg/dir"),
+                ("HOME", "/home/person"),
+            ])),
+            PathBuf::from("/secure/dir/.credentials.json")
+        );
+        // An empty CLAUDE_SECURESTORAGE_CONFIG_DIR means "use the default
+        // directory", never the literal empty path.
+        assert_eq!(
+            native_claude_credentials_path_from_lookup(env_lookup(&[
+                ("CLAUDE_SECURESTORAGE_CONFIG_DIR", ""),
+                ("CLAUDE_CONFIG_DIR", "/cfg/dir"),
+                ("HOME", "/home/person"),
+            ])),
+            PathBuf::from("/home/person/.claude/.credentials.json")
+        );
+        // No securestorage variable: a non-empty CLAUDE_CONFIG_DIR is used.
+        assert_eq!(
+            native_claude_credentials_path_from_lookup(env_lookup(&[
+                ("CLAUDE_CONFIG_DIR", "/cfg/dir"),
+                ("HOME", "/home/person"),
+            ])),
+            PathBuf::from("/cfg/dir/.credentials.json")
+        );
+        // An empty CLAUDE_CONFIG_DIR is ignored and HOME/.claude is used.
+        assert_eq!(
+            native_claude_credentials_path_from_lookup(env_lookup(&[
+                ("CLAUDE_CONFIG_DIR", ""),
+                ("HOME", "/home/person"),
+            ])),
+            PathBuf::from("/home/person/.claude/.credentials.json")
+        );
+    }
+
+    #[test]
+    fn credentials_path_home_then_userprofile_then_current_dir() {
+        // HOME is the default directory when set and non-empty.
+        assert_eq!(
+            native_claude_credentials_path_from_lookup(env_lookup(&[("HOME", "/home/person")])),
+            PathBuf::from("/home/person/.claude/.credentials.json")
+        );
+        // An empty HOME is skipped in favour of USERPROFILE.
+        assert_eq!(
+            native_claude_credentials_path_from_lookup(env_lookup(&[
+                ("HOME", ""),
+                ("USERPROFILE", "/profile/person"),
+            ])),
+            PathBuf::from("/profile/person/.claude/.credentials.json")
+        );
+        // With neither, the current directory is the last resort.
+        assert_eq!(
+            native_claude_credentials_path_from_lookup(env_lookup(&[])),
+            PathBuf::from("./.claude/.credentials.json")
+        );
+    }
+
+    #[test]
+    fn public_credentials_path_matches_env_resolution() {
+        // The public entry point is exactly the lookup variant over the real
+        // process environment, and always names Claude Code's fallback file.
+        assert_eq!(
+            native_claude_credentials_path(),
+            native_claude_credentials_path_from_lookup(|key| std::env::var(key).ok())
+        );
+        assert_eq!(
+            native_claude_credentials_path()
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some(".credentials.json")
+        );
+    }
+
+    #[test]
+    fn keyring_service_matches_credentials_service() {
+        // The OAuth keyring service is the `-credentials` service, not the
+        // bare `Claude Code` API-key item.
+        let service = native_claude_keyring_service();
+        assert_eq!(service, native_claude_credentials_keychain_service());
+        assert!(
+            service.starts_with(NATIVE_CLAUDE_CREDENTIALS_KEYCHAIN_SERVICE),
+            "{service}"
+        );
+    }
+
+    #[test]
+    fn keyring_account_always_satisfies_claude_code_name_rule() {
+        // Whatever the environment holds, the resolved account is non-empty
+        // and only ever contains Claude Code's safe account characters.
+        let account = native_claude_keyring_account();
+        assert!(!account.is_empty());
+        assert!(
+            account
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+            "{account}"
+        );
+    }
+
+    #[test]
+    fn trusted_device_token_parse_enforces_length_bounds() {
+        assert_eq!(
+            NativeTrustedDeviceToken::parse("device-secret".to_owned())
+                .unwrap()
+                .expose(),
+            "device-secret"
+        );
+        let empty = NativeTrustedDeviceToken::parse(String::new()).unwrap_err();
+        assert!(matches!(
+            empty,
+            Error::Protocol(ref message) if message.contains("trusted-device token length is invalid")
+        ));
+        let too_long =
+            NativeTrustedDeviceToken::parse("a".repeat(MAX_TRUSTED_DEVICE_TOKEN_BYTES + 1))
+                .unwrap_err();
+        assert!(matches!(
+            too_long,
+            Error::Protocol(ref message) if message.contains("trusted-device token length is invalid")
+        ));
+        // A token exactly at the limit is still accepted.
+        let at_limit = "a".repeat(MAX_TRUSTED_DEVICE_TOKEN_BYTES);
+        assert_eq!(
+            NativeTrustedDeviceToken::parse(at_limit.clone())
+                .unwrap()
+                .expose(),
+            at_limit
+        );
+    }
+
+    #[test]
+    fn parse_rejects_oversized_document_before_parsing() {
+        let blob = vec![b' '; MAX_NATIVE_DOCUMENT_BYTES as usize + 1];
+        let error = parse_native_document(&blob, file_source()).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Protocol(ref message) if message.contains("exceeds 64 KiB")
+        ));
+    }
+
+    #[test]
+    fn parse_requires_a_claude_ai_oauth_entry() {
+        let error = parse_native_document(b"{}", file_source()).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Protocol(ref message) if message.contains("no claudeAiOauth entry")
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_malformed_access_and_refresh_tokens() {
+        let bad_access = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"not-a-token","refreshToken":"{REFRESH}","expiresAt":1700000000000}}}}"#
+        );
+        assert!(matches!(
+            parse_native_document(bad_access.as_bytes(), file_source()).unwrap_err(),
+            Error::MalformedTokenResponse("access_token")
+        ));
+        let bad_refresh = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{ACCESS}","refreshToken":"not-a-token","expiresAt":1700000000000}}}}"#
+        );
+        assert!(matches!(
+            parse_native_document(bad_refresh.as_bytes(), file_source()).unwrap_err(),
+            Error::MalformedTokenResponse("refresh_token")
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_out_of_range_expiries() {
+        let bad_access_expiry = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{ACCESS}","refreshToken":"{REFRESH}","expiresAt":9223372036854775807}}}}"#
+        );
+        assert!(matches!(
+            parse_native_document(bad_access_expiry.as_bytes(), file_source()).unwrap_err(),
+            Error::Protocol(ref message) if message.contains("access-token expiry is invalid")
+        ));
+        let bad_refresh_expiry = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{ACCESS}","refreshToken":"{REFRESH}","expiresAt":1700000000000,"refreshTokenExpiresAt":9223372036854775807}}}}"#
+        );
+        assert!(matches!(
+            parse_native_document(bad_refresh_expiry.as_bytes(), file_source()).unwrap_err(),
+            Error::Protocol(ref message) if message.contains("refresh-token expiry is invalid")
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_empty_trusted_device_token() {
+        let raw = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{ACCESS}","refreshToken":"{REFRESH}","expiresAt":1700000000000}},"trustedDeviceToken":""}}"#
+        );
+        assert!(matches!(
+            parse_native_document(raw.as_bytes(), file_source()).unwrap_err(),
+            Error::Protocol(ref message) if message.contains("trusted-device token length is invalid")
+        ));
+    }
+
+    #[test]
+    fn parse_accepts_minimal_document_and_skips_scope_check_when_empty() {
+        let raw = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{ACCESS}","refreshToken":"{REFRESH}","expiresAt":1700000000000}}}}"#
+        );
+        let imported = parse_native_document(raw.as_bytes(), file_source()).unwrap();
+        assert_eq!(imported.tokens.access.expose(), ACCESS);
+        assert_eq!(imported.tokens.refresh.expose(), REFRESH);
+        // Absent optional fields default empty/None; an empty scope set skips
+        // the user:inference requirement entirely.
+        assert!(imported.tokens.scopes.is_empty());
+        assert!(imported.tokens.refresh_expires_at.is_none());
+        assert!(imported.subscription_type.is_none());
+        assert!(imported.rate_limit_tier.is_none());
+        assert!(imported.client_id.is_none());
+        assert!(imported.trusted_device_token.is_none());
+        assert_eq!(
+            imported.tokens.expires_at,
+            Utc.timestamp_millis_opt(1_700_000_000_000)
+                .single()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn discover_falls_back_to_the_plaintext_file() {
+        let root = temporary_directory("discover");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(".credentials.json");
+        std::fs::write(&path, native_json()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let discovered = discover_native_claude_credentials(Some(&path)).unwrap();
+        assert_eq!(discovered.tokens.access.expose(), ACCESS);
+        assert_eq!(discovered.tokens.refresh.expose(), REFRESH);
+        assert_eq!(discovered.subscription_type.as_deref(), Some("max"));
+        assert_eq!(discovered.rate_limit_tier.as_deref(), Some("tier"));
+        assert_eq!(discovered.client_id.as_deref(), Some("client"));
+        assert_eq!(
+            discovered.trusted_device_token.as_ref().unwrap().expose(),
+            "trusted-secret"
+        );
+        assert_eq!(
+            discovered.source,
+            NativeClaudeCredentialSource::CredentialsFile(path.clone())
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn discover_reports_a_missing_file_as_io_not_found() {
+        let root = temporary_directory("discover-missing");
+        let path = root.join(".credentials.json");
+        let error = discover_native_claude_credentials(Some(&path)).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Io(ref io) if io.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
 }
