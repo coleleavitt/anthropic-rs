@@ -50,15 +50,24 @@ unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
+# Diagnostic tracing for the credential-resolution and 401-recovery decision
+# points. A no-op without a subscriber, so the "no I/O" base build is unchanged.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
 serde_json = { version = "1", features = ["preserve_order"] }
 httparse = { version = "1.10", optional = true }
 keyring = { version = "3.6", optional = true }
 libc = "0.2"
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"], optional = true }
 tokio = { version = "1.53", features = ["io-util", "net", "rt", "sync", "time"], optional = true }
-reqwest = { version = "0.13", default-features = false, features = [
+# rustls-tls (ring, webpki roots) rather than 0.13's `rustls`, which selects
+# aws-lc-rs: aws-lc-sys carries the OpenSSL licence that strict consumers
+# (e.g. prime-agent's `cargo deny`) reject, and adds a C build to every target.
+# Only the API both versions share is used (Client, ClientBuilder, header, JSON
+# and streaming bodies).
+reqwest = { version = "0.12", default-features = false, features = [
     "json",
-    "rustls",
+    "rustls-tls",
     "stream",
     "http2",
 ], optional = true }

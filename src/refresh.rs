@@ -942,21 +942,36 @@ impl OAuthClient {
             failure,
         };
         let Ok(loaded) = AccountStore::load_or_migrate_from(path, &[]) else {
+            tracing::warn!("a 401 recovery could not read the account store; cannot refresh");
             return Ok(failed(None));
         };
         let Some(account) = loaded.store.find_by_access_token(rejected_access) else {
+            tracing::debug!(
+                "a 401 recovery found no store account holding the rejected access token (it may have been rotated already)"
+            );
             return Ok(failed(None));
         };
         let Some(stored) = account
             .oauth()
             .filter(|t| !t.refresh.expose().trim().is_empty())
         else {
+            tracing::warn!(
+                account = %account.id,
+                "a 401 recovery found the login but it carries no refresh token; re-login is required"
+            );
             return Ok(failed(None));
         };
         let served = shared_credential_receipt(&account.id, stored);
         let outcome = match self.refresh_shared(path, stored, options).await {
             Ok(outcome) => outcome,
-            Err(error) => return Ok(failed(Some(error))),
+            Err(error) => {
+                tracing::warn!(
+                    account = %account.id,
+                    error = %error,
+                    "a 401 recovery refresh of the login failed (its refresh token may be revoked); re-login may be required"
+                );
+                return Ok(failed(Some(error)));
+            }
         };
         let current_id = outcome
             .account_id
@@ -974,6 +989,19 @@ impl OAuthClient {
             ..current
         };
         let decision = decide_retry_after_401(&served, Some(&current));
+        if decision.retry {
+            tracing::info!(
+                account = %current_id,
+                reason = decision.reason.as_str(),
+                "a 401 recovery refreshed the shared-store login; retrying once with the new token"
+            );
+        } else {
+            tracing::info!(
+                account = %current_id,
+                reason = decision.reason.as_str(),
+                "a 401 recovery refresh produced no usable new token; not retrying (re-login may be required)"
+            );
+        }
         Ok(UnauthorizedRecovery {
             decision,
             outcome: decision.retry.then_some(outcome),
