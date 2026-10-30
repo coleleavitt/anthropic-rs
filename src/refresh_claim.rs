@@ -204,7 +204,8 @@ impl AccountStore {
     /// Commit a refresh result: compare-and-swap on the refresh token that was
     /// presented (`expected_refresh`), optionally fenced on `lease_id`, then
     /// install `refreshed`, clear the dead-token record, last error and
-    /// lease, stamp `last_refreshed_at`, and pin the account as `current`.
+    /// lease, stamp `last_refreshed_at`, and pin the account as `current` unless another login that can
+    /// serve is pinned already.
     /// Returns `false` (leaving the newer stored session untouched) when
     /// another process already rotated the token or the lease was taken over.
     ///
@@ -292,7 +293,22 @@ impl AccountStore {
         account.clear_error();
         account.refresh_lease = None;
         account.last_refreshed_at = Some(now);
-        self.current = Some(account_id.to_owned());
+        // The refreshed login becomes the pinned one only when no other login can take the requests:
+        // a refresh of an idle spare (the keep-alive renewing a login nobody uses) must not take over
+        // from the login in use - it may be one whose weekly window is spent.
+        let pinned_can_serve = self
+            .current
+            .as_deref()
+            .filter(|pinned| *pinned != account_id)
+            .and_then(|pinned| self.accounts.iter().find(|a| a.id == pinned))
+            .is_some_and(|pinned| {
+                pinned.is_available(now)
+                    && (pinned.oauth_credential_is_live(now)
+                        || crate::routing::refresh_exclusion(pinned, now).is_none())
+            });
+        if !pinned_can_serve {
+            self.current = Some(account_id.to_owned());
+        }
         true
     }
 
@@ -528,6 +544,40 @@ mod tests {
             two.claim_refresh("b", &rb, at(0), Duration::seconds(30), None),
             RefreshClaim::Claimed { .. }
         ));
+    }
+
+    #[test]
+    fn a_refresh_of_an_idle_login_leaves_a_pinned_login_that_can_serve_alone() {
+        let mut s = store(&["idle", "in-use"]);
+        s.current = Some("in-use".into());
+        let old = refresh_of(&s, "idle");
+        let rotated = tokens(
+            "sk-ant-ort01-rotated-refresh-aaaaaaaaaaaaaa",
+            "sk-ant-oat01-rotated-access-aaaaaaaaaaaaaa",
+        );
+
+        assert!(s.commit_refresh_before_expiry("idle", &old, None, rotated, at(10)));
+
+        assert_eq!(s.current.as_deref(), Some("in-use"));
+    }
+
+    #[test]
+    fn a_refresh_pins_its_login_when_the_pinned_one_cannot_serve() {
+        let mut s = store(&["fresh", "spent"]);
+        s.current = Some("spent".into());
+        if let Credential::Oauth(spent) = &mut s.accounts[1].credential {
+            spent.expires_at = at(5);
+            spent.refresh_expires_at = Some(at(5));
+        }
+        let old = refresh_of(&s, "fresh");
+        let rotated = tokens(
+            "sk-ant-ort01-rotated-refresh-aaaaaaaaaaaaaa",
+            "sk-ant-oat01-rotated-access-aaaaaaaaaaaaaa",
+        );
+
+        assert!(s.commit_refresh_before_expiry("fresh", &old, None, rotated, at(10)));
+
+        assert_eq!(s.current.as_deref(), Some("fresh"));
     }
 
     #[test]
